@@ -145,7 +145,7 @@ void PersonDetector::run_inference_(const FrameView &frame) {
   img.height = frame.height;
   switch (frame.format) {
     case FRAME_FORMAT_RGB565:
-      img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565;
+      img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;
       break;
     case FRAME_FORMAT_GRAYSCALE:
       img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_GRAY;
