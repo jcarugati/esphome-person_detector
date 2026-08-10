@@ -123,6 +123,7 @@ class PersonDetector : public Component {
 
   // Debounce / publish state (main loop only)
   bool present_state_{false};
+  bool presence_initialized_{false};
   uint8_t miss_streak_{0};
   std::atomic<bool> force_clear_{false};
 

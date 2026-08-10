@@ -41,6 +41,7 @@ class _PresenceBehavior:
     def __init__(self, clear_after: int = 3) -> None:
         self.clear_after = clear_after
         self.present = False
+        self.initialized = False
         self.misses = 0
         self.events: list[tuple[str, bool]] = []
 
@@ -49,6 +50,7 @@ class _PresenceBehavior:
             self.misses = 0
             if not self.present:
                 self.present = True
+                self.initialized = True
                 self.events.append(("state", True))
                 self.events.append(("automation", True))
         elif self.present:
@@ -56,11 +58,13 @@ class _PresenceBehavior:
             if self.misses >= self.clear_after:
                 self.misses = 0
                 self.present = False
+                self.initialized = True
                 self.events.append(("state", False))
                 self.events.append(("automation", False))
-        else:
+        elif not self.initialized:
             # The production branch must publish this state directly, without
             # routing through publish_present_(false), which fires on_cleared.
+            self.initialized = True
             self.events.append(("state", False))
 
 
@@ -69,20 +73,28 @@ class PersonDetectorStateRegression(unittest.TestCase):
         debounce = _debounce_source()
 
         # The negative-result path must be an explicit branch for the initial
-        # false state.  This fails against the current `else if (present_state_)`
-        # implementation, which silently drops the first valid miss.
+        # false state.  This also prevents repeated misses from publishing the
+        # same state over and over after initialization.
         negative = re.search(
-            r"  \} else \{(?P<body>.*?)\n  \}\n\}", debounce, flags=re.DOTALL
+            r"  \} else if \(!this->presence_initialized_\) \{(?P<body>.*?)\n  \}\n\}",
+            debounce,
+            flags=re.DOTALL,
         )
         self.assertIsNotNone(
             negative,
-            "negative-result handling must include an initial-state else branch",
+            "negative-result handling must guard the initial-state branch",
         )
         assert negative is not None
         body = negative.group("body")
+        self.assertIn("this->presence_initialized_ = true", body)
         self.assertIn("this->binary_sensor_->publish_state(false)", body)
         self.assertNotIn("publish_present_(false)", body)
         self.assertNotIn("on_cleared_", body)
+
+        self.assertIn(
+            "bool presence_initialized_{false};",
+            SOURCE.with_name("person_detector.h").read_text(encoding="utf-8"),
+        )
 
         # The branch is reached only after the enabled and valid-result guards;
         # an enabled detector cannot claim clear before inference produces data.
@@ -95,7 +107,27 @@ class PersonDetectorStateRegression(unittest.TestCase):
 
         detector = _PresenceBehavior()
         detector.consume(False)
+        detector.consume(False)
+        detector.consume(False)
         self.assertEqual(detector.events, [("state", False)])
+
+    def test_positive_and_debounced_clear_callbacks_remain_unchanged(self) -> None:
+        detector = _PresenceBehavior()
+        detector.consume(True)
+        detector.consume(False)
+        detector.consume(False)
+        self.assertEqual(detector.events, [("state", True), ("automation", True)])
+
+        detector.consume(False)
+        self.assertEqual(
+            detector.events,
+            [
+                ("state", True),
+                ("automation", True),
+                ("state", False),
+                ("automation", False),
+            ],
+        )
 
 
 if __name__ == "__main__":
