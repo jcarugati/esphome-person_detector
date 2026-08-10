@@ -304,6 +304,13 @@ void PersonDetector::loop() {
       this->miss_streak_ = 0;
       this->publish_present_(false);
     }
+  } else {
+#ifdef USE_BINARY_SENSOR
+    // The first valid negative inference initializes Occupancy without firing
+    // on_cleared, which is reserved for clearing an asserted presence state.
+    if (this->binary_sensor_ != nullptr)
+      this->binary_sensor_->publish_state(false);
+#endif
   }
 }
 
