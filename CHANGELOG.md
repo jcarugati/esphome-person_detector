@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Update `espressif/pedestrian_detect` to `0.3.2` (ESP-DL 3.3.x) so builds with
+  ESPHome 2026.7.0's `runtime_image` dependency resolve without the incompatible
+  ESP-DSP 1.7.0 pin.
+
 ## v0.4.0 — ambient light sensor + privacy-switch boot-gate fix
 
 **Ambient light sensor.** The device has no dedicated light sensor, but the

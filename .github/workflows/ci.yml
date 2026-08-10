@@ -13,7 +13,7 @@ concurrency:
 env:
   # Pin the ESPHome release this component is developed/tested against.
   # Bump together with the ESP-IDF pin documented in DESIGN.md / README.
-  ESPHOME_VERSION: "2026.6.0"
+  ESPHOME_VERSION: "2026.7.0"
 
 jobs:
   # Required gate: validates ALL of this component's Python codegen + schema

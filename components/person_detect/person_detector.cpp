@@ -68,6 +68,7 @@ void PersonDetector::setup() {
     this->source_->start();
   } else {
     ESP_LOGCONFIG(TAG, "Detection disabled at boot (privacy switch); camera idle");
+    this->presence_initialized_ = true;
 #ifdef USE_BINARY_SENSOR
     // Publish a definite "not occupied" so the entity isn't left unknown in
     // Home Assistant while the camera stays idle. Done directly (not via
@@ -145,7 +146,7 @@ void PersonDetector::run_inference_(const FrameView &frame) {
   img.height = frame.height;
   switch (frame.format) {
     case FRAME_FORMAT_RGB565:
-      img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565;
+      img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;
       break;
     case FRAME_FORMAT_GRAYSCALE:
       img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_GRAY;
@@ -252,6 +253,15 @@ void PersonDetector::loop() {
     this->miss_streak_ = 0;
     if (this->present_state_)
       this->publish_present_(false);
+    else if (!this->presence_initialized_) {
+      // Privacy can be disabled before the first inference; initialize the
+      // entity directly so Home Assistant does not remain unknown.
+      this->presence_initialized_ = true;
+#ifdef USE_BINARY_SENSOR
+      if (this->binary_sensor_ != nullptr)
+        this->binary_sensor_->publish_state(false);
+#endif
+    }
     // Privacy off: reset the numeric sensors too. Otherwise they stay frozen at
     // their last reading (e.g. 92% confidence, count 2) while presence reads
     // clear, showing contradictory state in Home Assistant.
@@ -304,10 +314,19 @@ void PersonDetector::loop() {
       this->miss_streak_ = 0;
       this->publish_present_(false);
     }
+  } else if (!this->presence_initialized_) {
+    this->presence_initialized_ = true;
+#ifdef USE_BINARY_SENSOR
+    // The first valid negative inference initializes Occupancy without firing
+    // on_cleared, which is reserved for clearing an asserted presence state.
+    if (this->binary_sensor_ != nullptr)
+      this->binary_sensor_->publish_state(false);
+#endif
   }
 }
 
 void PersonDetector::publish_present_(bool present) {
+  this->presence_initialized_ = true;
   this->present_state_ = present;
 #ifdef USE_BINARY_SENSOR
   if (this->binary_sensor_ != nullptr)

@@ -60,7 +60,7 @@ MODELS = {
 # ESP-DL model package on the ESP Component Registry. Pulling it also brings
 # esp-dl transitively via its manifest. Pinned for reproducible builds.
 PEDESTRIAN_DETECT_COMPONENT = "espressif/pedestrian_detect"
-PEDESTRIAN_DETECT_REF = "0.3.0"
+PEDESTRIAN_DETECT_REF = "0.3.2"
 
 CONF_CAMERA_ID = "camera_id"
 CONF_FRAME_SOURCE_ID = "frame_source_id"
