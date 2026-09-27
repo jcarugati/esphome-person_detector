@@ -85,6 +85,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   void set_exposure(int e) { this->exposure_ = e; }
   void set_gain(int g) { this->gain_ = g; }
   void set_snapshot(bool enabled) { this->snapshot_enabled_ = enabled; }
+  void set_auto_white_balance(bool enabled) { this->awb_enabled_ = enabled; }
 
   // Blocking, for the HTTP task: waits for the detector's next acquire() to
   // JPEG-encode its frame. The buffer stays valid until the next request.
@@ -159,6 +160,14 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
 
   uint32_t capture_failures_{0};
   uint32_t last_ppa_us_{0};
+
+  // Gray-world AWB on the ISP's red/blue gains, stepped from acquire().
+  void white_balance_step_();
+  bool awb_enabled_{false};
+  int isp_fd_{-1};
+  float red_gain_{1.0f};
+  float blue_gain_{1.0f};
+  int64_t last_awb_us_{0};
 
   // Snapshot: the frame owner (detector task) encodes on request, so the
   // sensor keeps a single reader. ponytail: one waiter; httpd is single-task.
