@@ -28,12 +28,43 @@
 #include "esp_video_init.h"
 
 #include "driver/i2c_master.h"  // i2c_master_get_bus_handle for shared-bus SCCB
+#include "driver/jpeg_encode.h"
+
+#ifdef USE_WEBSERVER
+#include "esphome/components/web_server_base/web_server_base.h"
+#endif
 
 namespace esphome {
 namespace esp_video_camera {
 
 static const char *const TAG = "esp_video_camera";
 static const char *const VIDEO_DEVICE = "/dev/video0";
+
+#ifdef USE_WEBSERVER
+// GET /snapshot.jpg, behind the web server's own auth (add_handler wraps it).
+class SnapshotHandler : public AsyncWebHandler {
+ public:
+  explicit SnapshotHandler(EspVideoCamera *cam) : cam_(cam) {}
+  bool canHandle(AsyncWebServerRequest *request) const override {
+    char buf[AsyncWebServerRequest::URL_BUF_SIZE];
+    return request->method() == HTTP_GET && request->url_to(buf) == "/snapshot.jpg";
+  }
+  void handleRequest(AsyncWebServerRequest *request) override {
+    const uint8_t *data = nullptr;
+    size_t len = 0;
+    if (!this->cam_->capture_jpeg(data, len, 4000)) {
+      request->send(503, "text/plain", "camera idle or busy");
+      return;
+    }
+    auto *rsp = request->beginResponse(200, "image/jpeg", data, len);
+    rsp->addHeader("Cache-Control", "no-store");
+    request->send(rsp);
+  }
+
+ protected:
+  EspVideoCamera *cam_;
+};
+#endif
 
 static int xioctl(int fd, unsigned long req, void *arg) {
   int r;
@@ -130,6 +161,12 @@ void EspVideoCamera::setup() {
   }
 
   this->ready_ = true;
+#ifdef USE_WEBSERVER
+  if (this->snapshot_enabled_) {
+    this->snapshot_done_ = xSemaphoreCreateBinary();
+    web_server_base::global_web_server_base->add_handler(new SnapshotHandler(this));  // NOLINT
+  }
+#endif
   ESP_LOGCONFIG(TAG, "esp_video_camera ready: capture %ux%u -> rotate %u -> "
                      "RGB888 %ux%u",
                 this->cap_w_, this->cap_h_, this->rotation_, this->out_w_,
@@ -509,11 +546,67 @@ bool EspVideoCamera::acquire(person_detect::FrameView &out, uint32_t timeout_ms)
     return false;
   }
 
+  if (this->snapshot_requested_.load())
+    this->encode_snapshot_();
+
   out.data = static_cast<const uint8_t *>(this->rotated_);
   out.width = this->out_w_;
   out.height = this->out_h_;
   out.format = person_detect::FRAME_FORMAT_RGB888;
   return true;
+}
+
+bool EspVideoCamera::capture_jpeg(const uint8_t *&data, size_t &len, uint32_t timeout_ms) {
+  if (this->snapshot_done_ == nullptr || !this->streaming_)
+    return false;
+  xSemaphoreTake(this->snapshot_done_, 0);  // drop a stale completion
+  this->snapshot_requested_.store(true);
+  if (xSemaphoreTake(this->snapshot_done_, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+    this->snapshot_requested_.store(false);
+    return false;
+  }
+  if (this->jpeg_len_ == 0)
+    return false;
+  data = this->jpeg_buf_;
+  len = this->jpeg_len_;
+  return true;
+}
+
+void EspVideoCamera::encode_snapshot_() {
+  this->jpeg_len_ = 0;
+  if (this->jpeg_encoder_ == nullptr) {
+    jpeg_encode_engine_cfg_t eng = {};
+    eng.timeout_ms = 500;
+    jpeg_encoder_handle_t h = nullptr;
+    if (jpeg_new_encoder_engine(&eng, &h) != ESP_OK) {
+      ESP_LOGW(TAG, "JPEG encoder init failed");
+    } else {
+      this->jpeg_encoder_ = h;
+      jpeg_encode_memory_alloc_cfg_t mem = {.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER};
+      // ponytail: fixed 1/4 of raw RGB888; ample for q70 indoor frames.
+      this->jpeg_buf_ = static_cast<uint8_t *>(
+          jpeg_alloc_encoder_mem(this->rotated_size_ / 4, &mem, &this->jpeg_buf_size_));
+    }
+  }
+  if (this->jpeg_encoder_ != nullptr && this->jpeg_buf_ != nullptr) {
+    jpeg_encode_cfg_t cfg = {};
+    cfg.width = this->out_w_;
+    cfg.height = this->out_h_;
+    cfg.src_type = JPEG_ENCODE_IN_FORMAT_RGB888;
+    cfg.sub_sample = JPEG_DOWN_SAMPLING_YUV420;
+    cfg.image_quality = 70;
+    uint32_t out = 0;
+    esp_err_t err = jpeg_encoder_process(static_cast<jpeg_encoder_handle_t>(this->jpeg_encoder_), &cfg,
+                                         static_cast<const uint8_t *>(this->rotated_),
+                                         (uint32_t) this->out_w_ * this->out_h_ * 3, this->jpeg_buf_,
+                                         this->jpeg_buf_size_, &out);
+    if (err == ESP_OK)
+      this->jpeg_len_ = out;
+    else
+      ESP_LOGW(TAG, "JPEG encode failed: %s", esp_err_to_name(err));
+  }
+  this->snapshot_requested_.store(false);
+  xSemaphoreGive(this->snapshot_done_);
 }
 
 void EspVideoCamera::release() {
