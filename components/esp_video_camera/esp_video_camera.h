@@ -19,7 +19,11 @@
 #include "esphome/components/i2c/i2c_bus.h"
 #endif
 
+#include <atomic>
 #include <vector>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "driver/ppa.h"
 
@@ -80,6 +84,12 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   void set_frame_buffer_count(uint8_t n) { this->fb_count_ = n; }
   void set_exposure(int e) { this->exposure_ = e; }
   void set_gain(int g) { this->gain_ = g; }
+  void set_snapshot(bool enabled) { this->snapshot_enabled_ = enabled; }
+
+  // Blocking, for the HTTP task: waits for the detector's next acquire() to
+  // JPEG-encode its frame. The buffer stays valid until the next request.
+  // False when the camera is idle (privacy switch off) or on timeout.
+  bool capture_jpeg(const uint8_t *&data, size_t &len, uint32_t timeout_ms);
 
  protected:
   bool power_on_sensor_();
@@ -149,6 +159,17 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
 
   uint32_t capture_failures_{0};
   uint32_t last_ppa_us_{0};
+
+  // Snapshot: the frame owner (detector task) encodes on request, so the
+  // sensor keeps a single reader. ponytail: one waiter; httpd is single-task.
+  void encode_snapshot_();
+  bool snapshot_enabled_{false};
+  std::atomic<bool> snapshot_requested_{false};
+  SemaphoreHandle_t snapshot_done_{nullptr};
+  void *jpeg_encoder_{nullptr};
+  uint8_t *jpeg_buf_{nullptr};
+  size_t jpeg_buf_size_{0};
+  size_t jpeg_len_{0};
 };
 
 }  // namespace esp_video_camera
