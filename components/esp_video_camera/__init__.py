@@ -137,8 +137,8 @@ CONFIG_SCHEMA = cv.Schema(
         # Serve GET /snapshot.jpg (HW JPEG of the detector's frame) through the
         # ESPHome web_server, inheriting its auth. Needs `web_server:`.
         cv.Optional(CONF_SNAPSHOT, default=False): cv.boolean,
-        # Gray-world white balance driven from the frame mean into the ISP
-        # red/blue gains (for sensors whose IPA AWB finds no white patches).
+        # Gray-world white balance on the /snapshot.jpg copy only; the
+        # detector frame and ISP are untouched.
         cv.Optional(CONF_AUTO_WHITE_BALANCE, default=False): cv.boolean,
         cv.Optional(CONF_FRAME_BUFFER_COUNT, default=2): cv.int_range(min=2, max=4),
         # Sensor exposure/gain in raw sensor units. Omit (or "auto") to let the
