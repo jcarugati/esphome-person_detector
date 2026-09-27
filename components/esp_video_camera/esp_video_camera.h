@@ -161,13 +161,9 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   uint32_t capture_failures_{0};
   uint32_t last_ppa_us_{0};
 
-  // Gray-world AWB on the ISP's red/blue gains, stepped from acquire().
-  void white_balance_step_();
+  // Gray-world white balance applied to a snapshot-only copy.
   bool awb_enabled_{false};
-  int isp_fd_{-1};
-  float red_gain_{1.0f};
-  float blue_gain_{1.0f};
-  int64_t last_awb_us_{0};
+  uint8_t *balanced_{nullptr};
 
   // Snapshot: the frame owner (detector task) encodes on request, so the
   // sensor keeps a single reader. ponytail: one waiter; httpd is single-task.

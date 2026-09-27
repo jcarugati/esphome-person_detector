@@ -29,8 +29,6 @@
 
 #include "driver/i2c_master.h"  // i2c_master_get_bus_handle for shared-bus SCCB
 #include "driver/jpeg_encode.h"
-#include "esp_video_device.h"
-#include "esp_video_isp_ioctl.h"
 #include "gray_world.h"
 
 #ifdef USE_WEBSERVER
@@ -549,10 +547,6 @@ bool EspVideoCamera::acquire(person_detect::FrameView &out, uint32_t timeout_ms)
     return false;
   }
 
-  if (this->awb_enabled_ && esp_timer_get_time() - this->last_awb_us_ > 2000000) {
-    this->last_awb_us_ = esp_timer_get_time();
-    this->white_balance_step_();
-  }
   if (this->snapshot_requested_.load())
     this->encode_snapshot_();
 
@@ -561,37 +555,6 @@ bool EspVideoCamera::acquire(person_detect::FrameView &out, uint32_t timeout_ms)
   out.height = this->out_h_;
   out.format = person_detect::FRAME_FORMAT_RGB888;
   return true;
-}
-
-void EspVideoCamera::white_balance_step_() {
-  // PPA RGB888 in memory is B,G,R (ESP-IDF little-endian convention, same as
-  // the JPEG encoder input). Sample every 16th pixel.
-  const uint8_t *px = static_cast<const uint8_t *>(this->rotated_);
-  const size_t n = static_cast<size_t>(this->out_w_) * this->out_h_;
-  uint64_t sb = 0, sg = 0, sr = 0;
-  for (size_t i = 0; i < n; i += 16) {
-    sb += px[i * 3];
-    sg += px[i * 3 + 1];
-    sr += px[i * 3 + 2];
-  }
-  if (!gray_world_step(sr, sg, sb, this->red_gain_, this->blue_gain_))
-    return;
-  if (this->isp_fd_ < 0)
-    this->isp_fd_ = open(ESP_VIDEO_ISP1_DEVICE_NAME, O_RDWR);
-  if (this->isp_fd_ < 0)
-    return;
-  esp_video_isp_wb_t wb = {.enable = true, .red_gain = this->red_gain_, .blue_gain = this->blue_gain_};
-  struct v4l2_ext_control c = {};
-  c.id = V4L2_CID_USER_ESP_ISP_WB;
-  c.size = sizeof(wb);
-  c.p_u8 = reinterpret_cast<uint8_t *>(&wb);
-  struct v4l2_ext_controls cs = {};
-  cs.ctrl_class = V4L2_CTRL_CLASS_USER;
-  cs.count = 1;
-  cs.controls = &c;
-  if (xioctl(this->isp_fd_, VIDIOC_S_EXT_CTRLS, &cs) == 0)
-    ESP_LOGD(TAG, "AWB mean rgb=%u/%u/%u -> gains r=%.2f b=%.2f", (unsigned) (sr * 16 / n),
-             (unsigned) (sg * 16 / n), (unsigned) (sb * 16 / n), this->red_gain_, this->blue_gain_);
 }
 
 bool EspVideoCamera::capture_jpeg(const uint8_t *&data, size_t &len, uint32_t timeout_ms) {
@@ -626,6 +589,15 @@ void EspVideoCamera::encode_snapshot_() {
           jpeg_alloc_encoder_mem(this->rotated_size_ / 4, &mem, &this->jpeg_buf_size_));
     }
   }
+  const uint8_t *src = static_cast<const uint8_t *>(this->rotated_);
+  if (this->awb_enabled_) {
+    if (this->balanced_ == nullptr)
+      this->balanced_ = static_cast<uint8_t *>(heap_caps_aligned_alloc(128, this->rotated_size_, MALLOC_CAP_SPIRAM));
+    if (this->balanced_ != nullptr) {
+      gray_world_copy(src, this->balanced_, static_cast<size_t>(this->out_w_) * this->out_h_);
+      src = this->balanced_;
+    }
+  }
   if (this->jpeg_encoder_ != nullptr && this->jpeg_buf_ != nullptr) {
     jpeg_encode_cfg_t cfg = {};
     cfg.width = this->out_w_;
@@ -635,8 +607,7 @@ void EspVideoCamera::encode_snapshot_() {
     cfg.image_quality = 70;
     uint32_t out = 0;
     esp_err_t err = jpeg_encoder_process(static_cast<jpeg_encoder_handle_t>(this->jpeg_encoder_), &cfg,
-                                         static_cast<const uint8_t *>(this->rotated_),
-                                         (uint32_t) this->out_w_ * this->out_h_ * 3, this->jpeg_buf_,
+                                         src, (uint32_t) this->out_w_ * this->out_h_ * 3, this->jpeg_buf_,
                                          this->jpeg_buf_size_, &out);
     if (err == ESP_OK)
       this->jpeg_len_ = out;
