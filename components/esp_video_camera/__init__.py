@@ -59,6 +59,7 @@ CONF_SWAP_RGB = "swap_rgb"
 CONF_FRAME_BUFFER_COUNT = "frame_buffer_count"
 CONF_IMU = "imu"
 CONF_SNAPSHOT = "snapshot"
+CONF_AUTO_WHITE_BALANCE = "auto_white_balance"
 
 # rotation: auto reads an accelerometer once at boot to keep people upright.
 ROTATION_AUTO = "auto"
@@ -136,6 +137,9 @@ CONFIG_SCHEMA = cv.Schema(
         # Serve GET /snapshot.jpg (HW JPEG of the detector's frame) through the
         # ESPHome web_server, inheriting its auth. Needs `web_server:`.
         cv.Optional(CONF_SNAPSHOT, default=False): cv.boolean,
+        # Gray-world white balance driven from the frame mean into the ISP
+        # red/blue gains (for sensors whose IPA AWB finds no white patches).
+        cv.Optional(CONF_AUTO_WHITE_BALANCE, default=False): cv.boolean,
         cv.Optional(CONF_FRAME_BUFFER_COUNT, default=2): cv.int_range(min=2, max=4),
         # Sensor exposure/gain in raw sensor units. Omit (or "auto") to let the
         # driver pick a bright default — the SC202CS powers up at its minimum
@@ -203,6 +207,7 @@ async def to_code(config):
     cg.add(var.set_swap_rgb(config[CONF_SWAP_RGB]))
     cg.add(var.set_frame_buffer_count(config[CONF_FRAME_BUFFER_COUNT]))
     cg.add(var.set_snapshot(config[CONF_SNAPSHOT]))
+    cg.add(var.set_auto_white_balance(config[CONF_AUTO_WHITE_BALANCE]))
     # -1 => auto (driver picks a bright default) for exposure/gain.
     exposure = config[CONF_EXPOSURE]
     cg.add(var.set_exposure(-1 if exposure == "auto" else exposure))
