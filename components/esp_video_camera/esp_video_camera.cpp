@@ -264,14 +264,7 @@ void EspVideoCamera::setup() {
     if (!this->task_mode_)
       ESP_LOGW(TAG, "camera task unavailable; streams follow the detector interval");
   }
-  if (this->h264_enabled_ && this->task_mode_) {
-    this->rtsp_send_mutex_ = xSemaphoreCreateMutex();
-    this->h264_ready_ = this->rtsp_send_mutex_ != nullptr && this->setup_h264_() &&
-        xTaskCreatePinnedToCore(&EspVideoCamera::rtsp_task_entry_, "camera_rtsp", 4096, this, 1,
-                                &this->rtsp_task_handle_, 0) == pdPASS;
-    if (!this->h264_ready_)
-      ESP_LOGW(TAG, "H.264/RTSP unavailable");
-  }
+  // H.264 is brought up later by the camera task (see start_h264_).
   ESP_LOGCONFIG(TAG, "esp_video_camera ready: capture %ux%u -> rotate %u -> "
                      "RGB888 %ux%u",
                 this->cap_w_, this->cap_h_, this->rotation_, this->out_w_,
@@ -766,12 +759,40 @@ void EspVideoCamera::capture_task_entry_(void *arg) {
   static_cast<EspVideoCamera *>(arg)->capture_task_();
 }
 
+// Brought up from the camera task well after boot so a failure here can't
+// block boot (OTA rollback) and its log lines reach the API log stream.
+void EspVideoCamera::start_h264_() {
+  ESP_LOGI(TAG, "H.264: setup (internal free %u, psram free %u)",
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  this->rtsp_send_mutex_ = xSemaphoreCreateMutex();
+  if (this->rtsp_send_mutex_ == nullptr || !this->setup_h264_()) {
+    ESP_LOGW(TAG, "H.264: encoder setup failed; RTSP disabled");
+    return;
+  }
+  ESP_LOGI(TAG, "H.264: encoder ready (internal free %u)",
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  if (xTaskCreatePinnedToCore(&EspVideoCamera::rtsp_task_entry_, "camera_rtsp", 8192, this, 1,
+                              &this->rtsp_task_handle_, 0) != pdPASS) {
+    ESP_LOGW(TAG, "H.264: RTSP task create failed");
+    return;
+  }
+  this->h264_ready_ = true;
+  ESP_LOGI(TAG, "H.264: RTSP listening on :8554");
+}
+
 void EspVideoCamera::capture_task_() {
   ESP_LOGI(TAG, "camera task running (task_mode=%s)", YESNO(this->task_mode_));
   bool camera_on = false;
+  bool h264_tried = false;
   for (;;) {
     if (!this->task_mode_)
       break;
+    // ponytail: fixed 30 s boot delay; lets ESPHome mark the app valid first.
+    if (this->h264_enabled_ && !h264_tried && esp_timer_get_time() > 30000000) {
+      h264_tried = true;
+      this->start_h264_();
+    }
     const bool wanted = this->stream_requested_.load();
     if (wanted && !camera_on) {
       int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;

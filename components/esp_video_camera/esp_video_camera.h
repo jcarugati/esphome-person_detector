@@ -116,6 +116,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   // Optional H.264/RTSP path. A low-priority camera task is the sole V4L2
   // reader; detector requests are serviced before stream frames.
   bool setup_h264_();
+  void start_h264_();
   bool convert_frame_(const void *input, void *output, size_t output_size,
                       uint16_t width, uint16_t height, ppa_srm_color_mode_t mode,
                       float scale_x, float scale_y);
