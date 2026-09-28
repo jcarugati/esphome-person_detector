@@ -183,6 +183,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   uint32_t last_ppa_us_{0};
 
   // H.264 encoder and single-client RTSP server (all dormant unless opted in).
+  bool task_mode_{false};  // camera task owns V4L2 (any live stream enabled)
   bool h264_ready_{false};
   int h264_fd_{-1};
   uint8_t *h264_yuv_{nullptr};

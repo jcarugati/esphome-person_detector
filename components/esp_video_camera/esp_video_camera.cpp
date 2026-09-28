@@ -78,7 +78,7 @@ class SnapshotHandler : public AsyncWebHandler {
 
 // GET /stream.mjpg, behind the same auth wrapper as /snapshot.jpg. This runs
 // in ESP-IDF's HTTP task, not ESPHome's main/LVGL loop, and exits on timeout or
-// the first failed socket write. The detector task remains the sole frame owner.
+// the first failed socket write. Frames come from the camera task when enabled.
 class MjpegHandler : public AsyncWebHandler {
  public:
   explicit MjpegHandler(EspVideoCamera *cam) : cam_(cam) {}
@@ -92,7 +92,13 @@ class MjpegHandler : public AsyncWebHandler {
       return;
     httpd_resp_set_hdr(raw, "Cache-Control", "no-store");
 
+    int64_t next_us = 0;
     while (true) {
+      // ponytail: fixed ~10 fps cap; keeps HW JPEG + gray-world off the UI's back.
+      const int64_t wait_us = next_us - esp_timer_get_time();
+      if (wait_us > 0)
+        vTaskDelay(pdMS_TO_TICKS(wait_us / 1000 + 1));
+      next_us = esp_timer_get_time() + MJPEG_MIN_FRAME_US;
       const uint8_t *data = nullptr;
       size_t len = 0;
       if (!this->cam_->capture_jpeg(data, len, 4000))
@@ -245,20 +251,23 @@ void EspVideoCamera::setup() {
   if (this->mjpeg_stream_enabled_)
     web_server_base::global_web_server_base->add_handler(new MjpegHandler(this));  // NOLINT
 #endif
-  if (this->h264_enabled_) {
+  // A dedicated camera task owns V4L2 whenever a live stream is enabled, so the
+  // stream gets fresh frames instead of the detector's interval.
+  if (this->h264_enabled_ || this->mjpeg_stream_enabled_) {
     this->frame_done_ = xSemaphoreCreateBinary();
+    this->task_mode_ = this->frame_done_ != nullptr &&
+        xTaskCreatePinnedToCore(&EspVideoCamera::capture_task_entry_, "camera_stream", 8192, this,
+                                1, &this->capture_task_handle_, 1) == pdPASS;
+    if (!this->task_mode_)
+      ESP_LOGW(TAG, "camera task unavailable; streams follow the detector interval");
+  }
+  if (this->h264_enabled_ && this->task_mode_) {
     this->rtsp_send_mutex_ = xSemaphoreCreateMutex();
-    this->h264_ready_ = this->frame_done_ != nullptr && this->rtsp_send_mutex_ != nullptr &&
-                        this->setup_h264_();
-    if (this->h264_ready_) {
-      BaseType_t capture_ok = xTaskCreatePinnedToCore(&EspVideoCamera::capture_task_entry_,
-          "camera_stream", 8192, this, 1, &this->capture_task_handle_, 1);
-      BaseType_t rtsp_ok = xTaskCreatePinnedToCore(&EspVideoCamera::rtsp_task_entry_,
-          "camera_rtsp", 4096, this, 1, &this->rtsp_task_handle_, 0);
-      this->h264_ready_ = capture_ok == pdPASS && rtsp_ok == pdPASS;
-    }
+    this->h264_ready_ = this->rtsp_send_mutex_ != nullptr && this->setup_h264_() &&
+        xTaskCreatePinnedToCore(&EspVideoCamera::rtsp_task_entry_, "camera_rtsp", 4096, this, 1,
+                                &this->rtsp_task_handle_, 0) == pdPASS;
     if (!this->h264_ready_)
-      ESP_LOGW(TAG, "H.264/RTSP unavailable; presence detection will use direct capture");
+      ESP_LOGW(TAG, "H.264/RTSP unavailable");
   }
   ESP_LOGCONFIG(TAG, "esp_video_camera ready: capture %ux%u -> rotate %u -> "
                      "RGB888 %ux%u",
@@ -564,7 +573,7 @@ bool EspVideoCamera::init() { return this->ready_; }
 bool EspVideoCamera::start() {
   if (!this->ready_)
     return false;
-  if (this->h264_ready_) {
+  if (this->task_mode_) {
     this->stream_requested_.store(true);
     return true;
   }
@@ -651,7 +660,7 @@ void EspVideoCamera::reassert_controls_() {
 }
 
 void EspVideoCamera::stop() {
-  if (this->h264_ready_) {
+  if (this->task_mode_) {
     this->stream_requested_.store(false);
     this->frame_requested_.store(false);
     return;
@@ -665,7 +674,7 @@ void EspVideoCamera::stop() {
 }
 
 bool EspVideoCamera::acquire(person_detect::FrameView &out, uint32_t timeout_ms) {
-  if (this->h264_ready_) {
+  if (this->task_mode_) {
     if (!this->stream_requested_.load())
       return false;
     xSemaphoreTake(this->frame_done_, 0);
@@ -757,7 +766,7 @@ void EspVideoCamera::capture_task_entry_(void *arg) {
 void EspVideoCamera::capture_task_() {
   bool camera_on = false;
   for (;;) {
-    if (!this->h264_ready_)
+    if (!this->task_mode_)
       break;
     const bool wanted = this->stream_requested_.load();
     if (wanted && !camera_on) {
@@ -1110,7 +1119,7 @@ void EspVideoCamera::encode_snapshot_() {
 }
 
 void EspVideoCamera::release() {
-  if (this->h264_ready_) {
+  if (this->task_mode_) {
     this->frame_in_use_.store(false);
     return;
   }
