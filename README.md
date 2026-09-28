@@ -17,12 +17,11 @@ work today and just need verifying.
 
 ## Privacy
 
-Nothing leaves the device. There's no cloud API, no companion server, and no
-streaming to Home Assistant — all inference runs locally. It uses no
-face-recognition models and stores no biometric data; it answers one question,
-"is a person in frame right now?", and nothing else. An optional `switch` turns
-detection on and off: on is the default, and turning it off releases the camera
-and stops all inference, so flipping it off gives you a hard privacy cut.
+Camera inference stays on-device; there is no cloud API, companion server, face
+recognition, or biometric storage. Optional authenticated `snapshot` and
+`mjpeg_stream` endpoints can expose frames on the local network when explicitly
+enabled. An optional `switch` turns detection off and releases the camera, so
+flipping it off gives you a hard privacy cut.
 
 ## The model
 
@@ -140,6 +139,9 @@ esp_video_camera:
   imu:                   # only needed for rotation: auto
     i2c_id: bus_expander
     address: 0x6A        # D1001 LSM6DS3TR
+  # snapshot: true        # authenticated GET /snapshot.jpg (needs web_server)
+  # mjpeg_stream: true    # authenticated GET /stream.mjpg, lazy while connected
+  # auto_white_balance: true  # gray-world correction on JPEGs only
   # exposure: 811        # raw sensor units; omit for a bright auto default
   # gain: 63             # raw sensor units; omit for auto
   # power/reset lines (D1001 wires these to the XL9535 expander):
