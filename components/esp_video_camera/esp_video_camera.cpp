@@ -3,15 +3,22 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
+#include <array>
 #include <cerrno>
 #include <cinttypes>
+#include <cctype>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
+#include "lwip/inet.h"
 #include "linux/videodev2.h"
 
 // ESP-IDF's <sys/mman.h> compat shim doesn't always define MAP_FAILED.
@@ -25,11 +32,13 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_video_device.h"
 #include "esp_video_init.h"
 
 #include "driver/i2c_master.h"  // i2c_master_get_bus_handle for shared-bus SCCB
 #include "driver/jpeg_encode.h"
 #include "gray_world.h"
+#include "h264_rtp.h"
 #include "mjpeg.h"
 
 #ifdef USE_WEBSERVER
@@ -125,6 +134,35 @@ static bool set_ext_ctrl(int fd, uint32_t cid, int value) {
   return xioctl(fd, VIDIOC_S_EXT_CTRLS, &cs) == 0;
 }
 
+static std::string rtsp_header(const std::string &request, const char *name) {
+  const size_t wanted = strlen(name);
+  size_t line = request.find("\r\n") + 2;
+  while (line >= 2 && line < request.size()) {
+    size_t end = request.find("\r\n", line);
+    if (end == std::string::npos || end == line)
+      break;
+    size_t colon = request.find(':', line);
+    if (colon < end && colon - line == wanted) {
+      bool match = true;
+      for (size_t i = 0; i < wanted; ++i) {
+        if (std::tolower(static_cast<unsigned char>(request[line + i])) !=
+            std::tolower(static_cast<unsigned char>(name[i]))) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        size_t value = colon + 1;
+        while (value < end && (request[value] == ' ' || request[value] == '\t'))
+          ++value;
+        return request.substr(value, end - value);
+      }
+    }
+    line = end + 2;
+  }
+  return {};
+}
+
 void EspVideoCamera::setup() {
   ESP_LOGCONFIG(TAG, "Setting up esp_video_camera (MIPI-CSI)...");
 
@@ -207,6 +245,21 @@ void EspVideoCamera::setup() {
   if (this->mjpeg_stream_enabled_)
     web_server_base::global_web_server_base->add_handler(new MjpegHandler(this));  // NOLINT
 #endif
+  if (this->h264_enabled_) {
+    this->frame_done_ = xSemaphoreCreateBinary();
+    this->rtsp_send_mutex_ = xSemaphoreCreateMutex();
+    this->h264_ready_ = this->frame_done_ != nullptr && this->rtsp_send_mutex_ != nullptr &&
+                        this->setup_h264_();
+    if (this->h264_ready_) {
+      BaseType_t capture_ok = xTaskCreatePinnedToCore(&EspVideoCamera::capture_task_entry_,
+          "camera_stream", 8192, this, 1, &this->capture_task_handle_, 1);
+      BaseType_t rtsp_ok = xTaskCreatePinnedToCore(&EspVideoCamera::rtsp_task_entry_,
+          "camera_rtsp", 4096, this, 1, &this->rtsp_task_handle_, 0);
+      this->h264_ready_ = capture_ok == pdPASS && rtsp_ok == pdPASS;
+    }
+    if (!this->h264_ready_)
+      ESP_LOGW(TAG, "H.264/RTSP unavailable; presence detection will use direct capture");
+  }
   ESP_LOGCONFIG(TAG, "esp_video_camera ready: capture %ux%u -> rotate %u -> "
                      "RGB888 %ux%u",
                 this->cap_w_, this->cap_h_, this->rotation_, this->out_w_,
@@ -341,19 +394,19 @@ bool EspVideoCamera::open_and_configure_() {
     buf.memory = V4L2_MEMORY_MMAP;
     buf.index = i;
     if (xioctl(this->fd_, VIDIOC_QUERYBUF, &buf) != 0) {
-      ESP_LOGE(TAG, "VIDIOC_QUERYBUF[%u] failed: %s", i, strerror(errno));
+      ESP_LOGE(TAG, "VIDIOC_QUERYBUF[%u] failed: %s", (unsigned) i, strerror(errno));
       return false;
     }
     this->buffers_[i].length = buf.length;
     this->buffers_[i].start = mmap(nullptr, buf.length, PROT_READ | PROT_WRITE,
                                    MAP_SHARED, this->fd_, buf.m.offset);
     if (this->buffers_[i].start == MAP_FAILED) {
-      ESP_LOGE(TAG, "mmap[%u] failed: %s", i, strerror(errno));
+      ESP_LOGE(TAG, "mmap[%u] failed: %s", (unsigned) i, strerror(errno));
       return false;
     }
     // Queue it for capture.
     if (xioctl(this->fd_, VIDIOC_QBUF, &buf) != 0) {
-      ESP_LOGE(TAG, "VIDIOC_QBUF[%u] failed: %s", i, strerror(errno));
+      ESP_LOGE(TAG, "VIDIOC_QBUF[%u] failed: %s", (unsigned) i, strerror(errno));
       return false;
     }
   }
@@ -391,11 +444,132 @@ bool EspVideoCamera::setup_ppa_() {
   return true;
 }
 
+bool EspVideoCamera::setup_h264_() {
+  this->h264_w_ = this->out_w_ / 2;
+  this->h264_h_ = this->out_h_ / 2;
+  this->h264_w_ &= ~1U;
+  this->h264_h_ &= ~1U;
+  this->h264_yuv_size_ = static_cast<size_t>(this->h264_w_) * this->h264_h_ * 3 / 2;
+  this->h264_yuv_ = static_cast<uint8_t *>(
+      heap_caps_aligned_alloc(128, this->h264_yuv_size_, MALLOC_CAP_SPIRAM));
+  if (this->h264_yuv_ == nullptr)
+    return false;
+
+  this->h264_fd_ = open(ESP_VIDEO_H264_DEVICE_NAME, O_RDWR | O_NONBLOCK);
+  if (this->h264_fd_ < 0) {
+    ESP_LOGW(TAG, "open(%s) failed: %s", ESP_VIDEO_H264_DEVICE_NAME, strerror(errno));
+    return false;
+  }
+
+  struct v4l2_format fmt = {};
+  fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+  fmt.fmt.pix.width = this->h264_w_;
+  fmt.fmt.pix.height = this->h264_h_;
+  fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+  if (xioctl(this->h264_fd_, VIDIOC_S_FMT, &fmt) != 0)
+    return false;
+
+  struct v4l2_requestbuffers req = {};
+  req.count = 1;
+  req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+  req.memory = V4L2_MEMORY_USERPTR;
+  if (xioctl(this->h264_fd_, VIDIOC_REQBUFS, &req) != 0)
+    return false;
+
+  fmt = {};
+  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  fmt.fmt.pix.width = this->h264_w_;
+  fmt.fmt.pix.height = this->h264_h_;
+  fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_H264;
+  fmt.fmt.pix.sizeimage = static_cast<uint32_t>(this->h264_w_) * this->h264_h_;
+  if (xioctl(this->h264_fd_, VIDIOC_S_FMT, &fmt) != 0)
+    return false;
+
+  req = {};
+  req.count = 1;
+  req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  req.memory = V4L2_MEMORY_MMAP;
+  if (xioctl(this->h264_fd_, VIDIOC_REQBUFS, &req) != 0)
+    return false;
+
+  struct v4l2_buffer buf = {};
+  buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  buf.memory = V4L2_MEMORY_MMAP;
+  buf.index = 0;
+  if (xioctl(this->h264_fd_, VIDIOC_QUERYBUF, &buf) != 0)
+    return false;
+  this->h264_output_size_ = buf.length;
+  this->h264_output_ = static_cast<uint8_t *>(mmap(nullptr, buf.length, PROT_READ | PROT_WRITE,
+                                                    MAP_SHARED, this->h264_fd_, buf.m.offset));
+  if (this->h264_output_ == MAP_FAILED)
+    return false;
+  if (xioctl(this->h264_fd_, VIDIOC_QBUF, &buf) != 0)
+    return false;
+
+  set_ext_ctrl(this->h264_fd_, V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, 15);
+  set_ext_ctrl(this->h264_fd_, V4L2_CID_MPEG_VIDEO_BITRATE, 1000000);
+  int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (xioctl(this->h264_fd_, VIDIOC_STREAMON, &type) != 0)
+    return false;
+  type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+  if (xioctl(this->h264_fd_, VIDIOC_STREAMON, &type) != 0)
+    return false;
+
+  ESP_LOGCONFIG(TAG, "H.264 RTSP: %ux%u @ 10 fps, 1 Mbps, TCP port 8554",
+                this->h264_w_, this->h264_h_);
+  return true;
+}
+
+bool EspVideoCamera::convert_frame_(const void *input, void *output, size_t output_size,
+                                    uint16_t width, uint16_t height,
+                                    ppa_srm_color_mode_t mode, float scale_x,
+                                    float scale_y) {
+  ppa_srm_rotation_angle_t angle = PPA_SRM_ROTATION_ANGLE_0;
+  if (this->rotation_ == 90)
+    angle = PPA_SRM_ROTATION_ANGLE_90;
+  else if (this->rotation_ == 180)
+    angle = PPA_SRM_ROTATION_ANGLE_180;
+  else if (this->rotation_ == 270)
+    angle = PPA_SRM_ROTATION_ANGLE_270;
+
+  ppa_srm_oper_config_t op = {};
+  op.in.buffer = input;
+  op.in.pic_w = this->cap_w_;
+  op.in.pic_h = this->cap_h_;
+  op.in.block_w = this->cap_w_;
+  op.in.block_h = this->cap_h_;
+  op.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  op.out.buffer = output;
+  op.out.buffer_size = output_size;
+  op.out.pic_w = width;
+  op.out.pic_h = height;
+  op.out.srm_cm = mode;
+  op.out.yuv_range = PPA_COLOR_RANGE_LIMIT;
+  op.out.yuv_std = PPA_COLOR_CONV_STD_RGB_YUV_BT601;
+  op.rotation_angle = angle;
+  op.scale_x = scale_x;
+  op.scale_y = scale_y;
+  op.rgb_swap = this->swap_rgb_;
+  op.mode = PPA_TRANS_MODE_BLOCKING;
+  int64_t t0 = esp_timer_get_time();
+  esp_err_t err = ppa_do_scale_rotate_mirror(this->ppa_, &op);
+  this->last_ppa_us_ = static_cast<uint32_t>(esp_timer_get_time() - t0);
+  if (err != ESP_OK)
+    ESP_LOGW(TAG, "PPA rotate/convert failed: %s", esp_err_to_name(err));
+  return err == ESP_OK;
+}
+
 bool EspVideoCamera::init() { return this->ready_; }
 
 bool EspVideoCamera::start() {
-  if (!this->ready_ || this->streaming_)
-    return this->ready_;
+  if (!this->ready_)
+    return false;
+  if (this->h264_ready_) {
+    this->stream_requested_.store(true);
+    return true;
+  }
+  if (this->streaming_.load())
+    return true;
   int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   if (xioctl(this->fd_, VIDIOC_STREAMON, &type) != 0) {
     ESP_LOGE(TAG, "VIDIOC_STREAMON failed: %s", strerror(errno));
@@ -477,7 +651,12 @@ void EspVideoCamera::reassert_controls_() {
 }
 
 void EspVideoCamera::stop() {
-  if (!this->streaming_)
+  if (this->h264_ready_) {
+    this->stream_requested_.store(false);
+    this->frame_requested_.store(false);
+    return;
+  }
+  if (!this->streaming_.load())
     return;
   int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   xioctl(this->fd_, VIDIOC_STREAMOFF, &type);
@@ -486,7 +665,23 @@ void EspVideoCamera::stop() {
 }
 
 bool EspVideoCamera::acquire(person_detect::FrameView &out, uint32_t timeout_ms) {
-  if (!this->streaming_)
+  if (this->h264_ready_) {
+    if (!this->stream_requested_.load())
+      return false;
+    xSemaphoreTake(this->frame_done_, 0);
+    this->frame_requested_.store(true);
+    if (xSemaphoreTake(this->frame_done_, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+      this->frame_requested_.store(false);
+      this->capture_failures_++;
+      return false;
+    }
+    out.data = static_cast<const uint8_t *>(this->rotated_);
+    out.width = this->out_w_;
+    out.height = this->out_h_;
+    out.format = person_detect::FRAME_FORMAT_RGB888;
+    return true;
+  }
+  if (!this->streaming_.load())
     return false;
 
   // Re-assert exposure/gain periodically: a set right at STREAMON occasionally
@@ -538,51 +733,10 @@ bool EspVideoCamera::acquire(person_detect::FrameView &out, uint32_t timeout_ms)
   this->dq_index_ = buf.index;
 
   // Rotate (portrait mount) + RGB565->RGB888 in one PPA pass.
-  ppa_srm_rotation_angle_t angle = PPA_SRM_ROTATION_ANGLE_0;
-  switch (this->rotation_) {
-    case 90:
-      angle = PPA_SRM_ROTATION_ANGLE_90;
-      break;
-    case 180:
-      angle = PPA_SRM_ROTATION_ANGLE_180;
-      break;
-    case 270:
-      angle = PPA_SRM_ROTATION_ANGLE_270;
-      break;
-    default:
-      angle = PPA_SRM_ROTATION_ANGLE_0;
-      break;
-  }
-
-  ppa_srm_oper_config_t op = {};
-  op.in.buffer = this->buffers_[this->dq_index_].start;
-  op.in.pic_w = this->cap_w_;
-  op.in.pic_h = this->cap_h_;
-  op.in.block_w = this->cap_w_;
-  op.in.block_h = this->cap_h_;
-  op.in.block_offset_x = 0;
-  op.in.block_offset_y = 0;
-  op.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-  op.out.buffer = this->rotated_;
-  op.out.buffer_size = this->rotated_size_;
-  op.out.pic_w = this->out_w_;
-  op.out.pic_h = this->out_h_;
-  op.out.block_offset_x = 0;
-  op.out.block_offset_y = 0;
-  op.out.srm_cm = PPA_SRM_COLOR_MODE_RGB888;
-  op.rotation_angle = angle;
-  op.scale_x = 1.0f;
-  op.scale_y = 1.0f;
-  op.rgb_swap = this->swap_rgb_;
-  op.byte_swap = false;
-  op.mode = PPA_TRANS_MODE_BLOCKING;
-
-  int64_t t0 = esp_timer_get_time();
-  esp_err_t err = ppa_do_scale_rotate_mirror(this->ppa_, &op);
-  this->last_ppa_us_ = static_cast<uint32_t>(esp_timer_get_time() - t0);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "PPA rotate/convert failed: %s", esp_err_to_name(err));
-    this->release();  // requeue the buffer
+  if (!this->convert_frame_(this->buffers_[this->dq_index_].start, this->rotated_,
+                            this->rotated_size_, this->out_w_, this->out_h_,
+                            PPA_SRM_COLOR_MODE_RGB888, 1.0f, 1.0f)) {
+    this->release();
     return false;
   }
 
@@ -596,8 +750,306 @@ bool EspVideoCamera::acquire(person_detect::FrameView &out, uint32_t timeout_ms)
   return true;
 }
 
+void EspVideoCamera::capture_task_entry_(void *arg) {
+  static_cast<EspVideoCamera *>(arg)->capture_task_();
+}
+
+void EspVideoCamera::capture_task_() {
+  bool camera_on = false;
+  for (;;) {
+    if (!this->h264_ready_)
+      break;
+    const bool wanted = this->stream_requested_.load();
+    if (wanted && !camera_on) {
+      int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      if (xioctl(this->fd_, VIDIOC_STREAMON, &type) == 0) {
+        camera_on = true;
+        this->streaming_.store(true);
+        this->apply_sensor_controls_();
+      } else {
+        ESP_LOGW(TAG, "camera STREAMON failed: %s", strerror(errno));
+        vTaskDelay(pdMS_TO_TICKS(250));
+        continue;
+      }
+    } else if (!wanted && camera_on) {
+      int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      xioctl(this->fd_, VIDIOC_STREAMOFF, &type);
+      camera_on = false;
+      this->streaming_.store(false);
+    }
+    if (!camera_on) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+    if (esp_timer_get_time() - this->last_ctrl_us_ > 2000000) {
+      this->reassert_controls_();
+      this->last_ctrl_us_ = esp_timer_get_time();
+    }
+
+    struct v4l2_buffer buf = {};
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(this->fd_, VIDIOC_DQBUF, &buf) != 0) {
+      if (errno != EAGAIN)
+        ESP_LOGW(TAG, "camera DQBUF failed: %s", strerror(errno));
+      vTaskDelay(pdMS_TO_TICKS(2));
+      continue;
+    }
+
+    void *raw = this->buffers_[buf.index].start;
+    const bool need_rgb = !this->frame_in_use_.load() &&
+                          (this->frame_requested_.load() || this->snapshot_requested_.load());
+    if (need_rgb && this->convert_frame_(raw, this->rotated_, this->rotated_size_,
+                                         this->out_w_, this->out_h_,
+                                         PPA_SRM_COLOR_MODE_RGB888, 1.0f, 1.0f)) {
+      if (this->frame_requested_.exchange(false)) {
+        this->frame_in_use_.store(true);
+        xSemaphoreGive(this->frame_done_);
+      }
+      if (this->snapshot_requested_.load())
+        this->encode_snapshot_();
+    }
+
+    const int64_t now = esp_timer_get_time();
+    if (this->rtsp_playing_.load() && now - this->last_h264_us_ >= 100000 &&
+        this->convert_frame_(raw, this->h264_yuv_, this->h264_yuv_size_,
+                             this->h264_w_, this->h264_h_, PPA_SRM_COLOR_MODE_YUV420,
+                             0.5f, 0.5f)) {
+      this->last_h264_us_ = now;
+      this->encode_h264_();
+    }
+
+    if (xioctl(this->fd_, VIDIOC_QBUF, &buf) != 0)
+      ESP_LOGW(TAG, "camera QBUF failed: %s", strerror(errno));
+  }
+  this->capture_task_handle_ = nullptr;
+  vTaskDelete(nullptr);
+}
+
+bool EspVideoCamera::encode_h264_() {
+  struct v4l2_buffer out = {};
+  out.index = 0;
+  out.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+  out.memory = V4L2_MEMORY_USERPTR;
+  out.m.userptr = reinterpret_cast<unsigned long>(this->h264_yuv_);
+  out.length = this->h264_yuv_size_;
+  out.bytesused = this->h264_yuv_size_;
+  if (xioctl(this->h264_fd_, VIDIOC_QBUF, &out) != 0)
+    return false;
+
+  struct v4l2_buffer encoded = {};
+  encoded.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  encoded.memory = V4L2_MEMORY_MMAP;
+  const int64_t deadline = esp_timer_get_time() + 200000;
+  while (xioctl(this->h264_fd_, VIDIOC_DQBUF, &encoded) != 0) {
+    if (errno != EAGAIN || esp_timer_get_time() >= deadline)
+      return false;
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+  while (xioctl(this->h264_fd_, VIDIOC_DQBUF, &out) != 0) {
+    if (errno != EAGAIN || esp_timer_get_time() >= deadline)
+      break;
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+
+  if (encoded.bytesused != 0)
+    this->send_h264_rtp_(this->h264_output_, encoded.bytesused);
+  if (xioctl(this->h264_fd_, VIDIOC_QBUF, &encoded) != 0)
+    return false;
+  return true;
+}
+
+bool EspVideoCamera::send_rtsp_(int fd, const char *data, size_t len) {
+  if (xSemaphoreTake(this->rtsp_send_mutex_, pdMS_TO_TICKS(200)) != pdTRUE)
+    return false;
+  size_t sent = 0;
+  while (sent < len) {
+    int n = send(fd, data + sent, len - sent, 0);
+    if (n <= 0) {
+      xSemaphoreGive(this->rtsp_send_mutex_);
+      return false;
+    }
+    sent += static_cast<size_t>(n);
+  }
+  xSemaphoreGive(this->rtsp_send_mutex_);
+  return true;
+}
+
+void EspVideoCamera::send_h264_rtp_(const uint8_t *data, size_t len) {
+  const int fd = this->rtsp_client_fd_.load();
+  if (fd < 0 || !this->rtsp_playing_.load())
+    return;
+
+  bool ok = true;
+  packetize_h264_annex_b(data, len, this->rtp_timestamp_, this->rtp_sequence_, 1400,
+      [&](const uint8_t *packet, size_t packet_len, bool) {
+        if (!ok)
+          return;
+        std::array<uint8_t, 1416> framed{};
+        framed[0] = '$';
+        framed[1] = 0;
+        framed[2] = static_cast<uint8_t>(packet_len >> 8);
+        framed[3] = static_cast<uint8_t>(packet_len);
+        memcpy(framed.data() + 4, packet, packet_len);
+        if (xSemaphoreTake(this->rtsp_send_mutex_, pdMS_TO_TICKS(20)) != pdTRUE) {
+          ok = false;
+          return;
+        }
+        int n = send(fd, framed.data(), packet_len + 4, MSG_DONTWAIT);
+        xSemaphoreGive(this->rtsp_send_mutex_);
+        ok = n == static_cast<int>(packet_len + 4);
+      });
+  this->rtp_timestamp_ += 9000;
+  if (!ok) {
+    this->rtsp_playing_.store(false);
+    shutdown(fd, SHUT_RDWR);
+  }
+}
+
+void EspVideoCamera::rtsp_task_entry_(void *arg) {
+  static_cast<EspVideoCamera *>(arg)->rtsp_task_();
+}
+
+void EspVideoCamera::rtsp_task_() {
+  int server = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+  if (server < 0) {
+    ESP_LOGW(TAG, "RTSP socket failed: %s", strerror(errno));
+    vTaskDelete(nullptr);
+    return;
+  }
+  int one = 1;
+  setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sockaddr_in address = {};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(8554);
+  address.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (bind(server, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
+      listen(server, 1) != 0) {
+    ESP_LOGW(TAG, "RTSP bind/listen failed: %s", strerror(errno));
+    close(server);
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  for (;;) {
+    int client = accept(server, nullptr, nullptr);
+    if (client < 0)
+      continue;
+    timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    this->rtsp_client_fd_.store(client);
+    this->rtsp_playing_.store(false);
+    bool setup = false;
+    std::string pending;
+
+    while (this->rtsp_client_fd_.load() == client) {
+      char chunk[1024];
+      int n = recv(client, chunk, sizeof(chunk), 0);
+      if (n == 0)
+        break;
+      if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+          continue;
+        break;
+      }
+      pending.append(chunk, n);
+      if (pending.size() > 4096)
+        break;
+
+      for (;;) {
+        if (!pending.empty() && pending[0] == '$') {
+          if (pending.size() < 4)
+            break;
+          size_t interleaved_len =
+              (static_cast<uint8_t>(pending[2]) << 8) | static_cast<uint8_t>(pending[3]);
+          if (pending.size() < interleaved_len + 4)
+            break;
+          pending.erase(0, interleaved_len + 4);  // ignore client RTCP
+          continue;
+        }
+        size_t request_end = pending.find("\r\n\r\n");
+        if (request_end == std::string::npos)
+          break;
+        std::string request = pending.substr(0, request_end + 4);
+        pending.erase(0, request_end + 4);
+        const std::string cseq = rtsp_header(request, "CSeq");
+        const std::string auth = rtsp_header(request, "Authorization");
+        char response[1024];
+        bool play_after_response = false;
+
+        if (auth != this->h264_auth_) {
+          snprintf(response, sizeof(response),
+                   "RTSP/1.0 401 Unauthorized\r\nCSeq: %s\r\n"
+                   "WWW-Authenticate: Basic realm=\"ESP32-P4 Camera\"\r\n\r\n",
+                   cseq.c_str());
+        } else if (request.rfind("OPTIONS ", 0) == 0) {
+          snprintf(response, sizeof(response),
+                   "RTSP/1.0 200 OK\r\nCSeq: %s\r\n"
+                   "Public: OPTIONS, DESCRIBE, SETUP, PLAY, GET_PARAMETER, TEARDOWN\r\n\r\n",
+                   cseq.c_str());
+        } else if (request.rfind("DESCRIBE ", 0) == 0) {
+          char sdp[384];
+          int sdp_len = snprintf(sdp, sizeof(sdp),
+              "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=ESP32-P4 Camera\r\nt=0 0\r\n"
+              "a=control:*\r\nm=video 0 RTP/AVP 96\r\nc=IN IP4 0.0.0.0\r\n"
+              "a=rtpmap:96 H264/90000\r\na=framerate:10\r\na=framesize:96 %u-%u\r\n"
+              "a=fmtp:96 packetization-mode=1\r\na=control:trackID=0\r\n",
+              this->h264_w_, this->h264_h_);
+          int head = snprintf(response, sizeof(response),
+              "RTSP/1.0 200 OK\r\nCSeq: %s\r\nContent-Type: application/sdp\r\n"
+              "Content-Length: %d\r\n\r\n%s", cseq.c_str(), sdp_len, sdp);
+          if (head < 0)
+            break;
+        } else if (request.rfind("SETUP ", 0) == 0) {
+          const std::string transport = rtsp_header(request, "Transport");
+          if (transport.find("RTP/AVP/TCP") == std::string::npos) {
+            snprintf(response, sizeof(response), "RTSP/1.0 461 Unsupported Transport\r\nCSeq: %s\r\n\r\n",
+                     cseq.c_str());
+          } else {
+            setup = true;
+            snprintf(response, sizeof(response),
+                     "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: 1\r\n"
+                     "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n",
+                     cseq.c_str());
+          }
+        } else if (request.rfind("PLAY ", 0) == 0 && setup) {
+          this->rtp_sequence_ = 0;
+          this->rtp_timestamp_ = 0;
+          play_after_response = true;
+          snprintf(response, sizeof(response),
+                   "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: 1\r\n"
+                   "RTP-Info: url=trackID=0;seq=0;rtptime=0\r\n\r\n", cseq.c_str());
+        } else if (request.rfind("GET_PARAMETER ", 0) == 0) {
+          snprintf(response, sizeof(response), "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: 1\r\n\r\n",
+                   cseq.c_str());
+        } else if (request.rfind("TEARDOWN ", 0) == 0) {
+          snprintf(response, sizeof(response), "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: 1\r\n\r\n",
+                   cseq.c_str());
+          this->send_rtsp_(client, response, strlen(response));
+          this->rtsp_playing_.store(false);
+          goto client_done;
+        } else {
+          snprintf(response, sizeof(response), "RTSP/1.0 405 Method Not Allowed\r\nCSeq: %s\r\n\r\n",
+                   cseq.c_str());
+        }
+        if (!this->send_rtsp_(client, response, strlen(response)))
+          goto client_done;
+        if (play_after_response)
+          this->rtsp_playing_.store(true);
+      }
+    }
+client_done:
+    this->rtsp_playing_.store(false);
+    this->rtsp_client_fd_.store(-1);
+    shutdown(client, SHUT_RDWR);
+    close(client);
+  }
+}
+
 bool EspVideoCamera::capture_jpeg(const uint8_t *&data, size_t &len, uint32_t timeout_ms) {
-  if (this->snapshot_done_ == nullptr || !this->streaming_)
+  if (this->snapshot_done_ == nullptr || !this->streaming_.load())
     return false;
   xSemaphoreTake(this->snapshot_done_, 0);  // drop a stale completion
   this->snapshot_requested_.store(true);
@@ -658,6 +1110,10 @@ void EspVideoCamera::encode_snapshot_() {
 }
 
 void EspVideoCamera::release() {
+  if (this->h264_ready_) {
+    this->frame_in_use_.store(false);
+    return;
+  }
   if (this->dq_index_ < 0)
     return;
   struct v4l2_buffer buf = {};
@@ -691,9 +1147,14 @@ void EspVideoCamera::dump_config() {
                 YESNO(this->swap_rgb_));
   ESP_LOGCONFIG(TAG, "  PPA output buffer: %u bytes PSRAM",
                 (unsigned) this->rotated_size_);
-  if (this->last_ppa_us_ != 0)
+  if (this->last_ppa_us_ != 0) {
     ESP_LOGCONFIG(TAG, "  Last PPA rotate: %u us", (unsigned) this->last_ppa_us_);
+  }
   ESP_LOGCONFIG(TAG, "  Capture failures: %u", (unsigned) this->capture_failures_);
+  if (this->h264_enabled_) {
+    ESP_LOGCONFIG(TAG, "  H.264 RTSP: %s, %ux%u, port 8554, Basic auth",
+                  this->h264_ready_ ? "ready" : "unavailable", this->h264_w_, this->h264_h_);
+  }
   if (this->is_failed())
     ESP_LOGE(TAG, "  Component failed to set up");
 }
