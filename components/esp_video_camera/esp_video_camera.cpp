@@ -30,6 +30,7 @@
 #include "driver/i2c_master.h"  // i2c_master_get_bus_handle for shared-bus SCCB
 #include "driver/jpeg_encode.h"
 #include "gray_world.h"
+#include "mjpeg.h"
 
 #ifdef USE_WEBSERVER
 #include "esphome/components/web_server_base/web_server_base.h"
@@ -60,6 +61,42 @@ class SnapshotHandler : public AsyncWebHandler {
     auto *rsp = request->beginResponse(200, "image/jpeg", data, len);
     rsp->addHeader("Cache-Control", "no-store");
     request->send(rsp);
+  }
+
+ protected:
+  EspVideoCamera *cam_;
+};
+
+// GET /stream.mjpg, behind the same auth wrapper as /snapshot.jpg. This runs
+// in ESP-IDF's HTTP task, not ESPHome's main/LVGL loop, and exits on timeout or
+// the first failed socket write. The detector task remains the sole frame owner.
+class MjpegHandler : public AsyncWebHandler {
+ public:
+  explicit MjpegHandler(EspVideoCamera *cam) : cam_(cam) {}
+  bool canHandle(AsyncWebServerRequest *request) const override {
+    char buf[AsyncWebServerRequest::URL_BUF_SIZE];
+    return request->method() == HTTP_GET && request->url_to(buf) == "/stream.mjpg";
+  }
+  void handleRequest(AsyncWebServerRequest *request) override {
+    auto *raw = static_cast<httpd_req_t *>(*request);
+    if (httpd_resp_set_type(raw, MJPEG_CONTENT_TYPE) != ESP_OK)
+      return;
+    httpd_resp_set_hdr(raw, "Cache-Control", "no-store");
+
+    while (true) {
+      const uint8_t *data = nullptr;
+      size_t len = 0;
+      if (!this->cam_->capture_jpeg(data, len, 4000))
+        break;
+      char part[96];
+      int part_len = format_mjpeg_part(part, sizeof(part), len);
+      if (part_len <= 0 || static_cast<size_t>(part_len) >= sizeof(part) ||
+          httpd_resp_send_chunk(raw, part, part_len) != ESP_OK ||
+          httpd_resp_send_chunk(raw, reinterpret_cast<const char *>(data), len) != ESP_OK ||
+          httpd_resp_send_chunk(raw, "\r\n", 2) != ESP_OK)
+        break;
+    }
+    httpd_resp_send_chunk(raw, nullptr, 0);
   }
 
  protected:
@@ -163,10 +200,12 @@ void EspVideoCamera::setup() {
 
   this->ready_ = true;
 #ifdef USE_WEBSERVER
-  if (this->snapshot_enabled_) {
+  if (this->snapshot_enabled_ || this->mjpeg_stream_enabled_)
     this->snapshot_done_ = xSemaphoreCreateBinary();
+  if (this->snapshot_enabled_)
     web_server_base::global_web_server_base->add_handler(new SnapshotHandler(this));  // NOLINT
-  }
+  if (this->mjpeg_stream_enabled_)
+    web_server_base::global_web_server_base->add_handler(new MjpegHandler(this));  // NOLINT
 #endif
   ESP_LOGCONFIG(TAG, "esp_video_camera ready: capture %ux%u -> rotate %u -> "
                      "RGB888 %ux%u",

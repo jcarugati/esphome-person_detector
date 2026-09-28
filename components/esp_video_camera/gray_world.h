@@ -1,5 +1,5 @@
 #pragma once
-// Gray-world white balance for the snapshot copy only (pure, host-testable).
+// Gray-world white balance for the JPEG copy only (pure, host-testable).
 // Output-space R/B gains from the frame mean; never touches the ISP/CCM the
 // detector shares (on P4 rev<3 ISP WB folds into the CCM and breaks it).
 // ponytail: whole-frame gray-world; a scene dominated by one color tints it.

@@ -85,6 +85,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   void set_exposure(int e) { this->exposure_ = e; }
   void set_gain(int g) { this->gain_ = g; }
   void set_snapshot(bool enabled) { this->snapshot_enabled_ = enabled; }
+  void set_mjpeg_stream(bool enabled) { this->mjpeg_stream_enabled_ = enabled; }
   void set_auto_white_balance(bool enabled) { this->awb_enabled_ = enabled; }
 
   // Blocking, for the HTTP task: waits for the detector's next acquire() to
@@ -161,14 +162,15 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   uint32_t capture_failures_{0};
   uint32_t last_ppa_us_{0};
 
-  // Gray-world white balance applied to a snapshot-only copy.
+  // Gray-world white balance applied to a JPEG-only copy.
   bool awb_enabled_{false};
   uint8_t *balanced_{nullptr};
 
-  // Snapshot: the frame owner (detector task) encodes on request, so the
-  // sensor keeps a single reader. ponytail: one waiter; httpd is single-task.
+  // JPEG: the frame owner (detector task) encodes on request, so the sensor
+  // keeps a single reader. ponytail: one waiter; httpd is single-task.
   void encode_snapshot_();
   bool snapshot_enabled_{false};
+  bool mjpeg_stream_enabled_{false};
   std::atomic<bool> snapshot_requested_{false};
   SemaphoreHandle_t snapshot_done_{nullptr};
   void *jpeg_encoder_{nullptr};
