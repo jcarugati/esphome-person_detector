@@ -9,6 +9,8 @@ This owns the camera hardware, unlike the ESPHome-camera JPEG path — it exists
 because stock ESPHome has no configurable MIPI-CSI camera platform yet.
 """
 
+import base64
+
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import pins
@@ -61,6 +63,9 @@ CONF_IMU = "imu"
 CONF_SNAPSHOT = "snapshot"
 CONF_MJPEG_STREAM = "mjpeg_stream"
 CONF_AUTO_WHITE_BALANCE = "auto_white_balance"
+CONF_H264_STREAM = "h264_stream"
+CONF_H264_USERNAME = "h264_username"
+CONF_H264_PASSWORD = "h264_password"
 
 # rotation: auto reads an accelerometer once at boot to keep people upright.
 ROTATION_AUTO = "auto"
@@ -144,6 +149,11 @@ CONFIG_SCHEMA = cv.Schema(
         # Gray-world white balance on the JPEG copy only; the detector frame and
         # ISP are untouched.
         cv.Optional(CONF_AUTO_WHITE_BALANCE, default=False): cv.boolean,
+        # Authenticated H.264 over RTSP/TCP on port 8554. Credentials are
+        # required only when opted in; reuse the web_server credentials in YAML.
+        cv.Optional(CONF_H264_STREAM, default=False): cv.boolean,
+        cv.Optional(CONF_H264_USERNAME): cv.string_strict,
+        cv.Optional(CONF_H264_PASSWORD): cv.string_strict,
         cv.Optional(CONF_FRAME_BUFFER_COUNT, default=2): cv.int_range(min=2, max=4),
         # Sensor exposure/gain in raw sensor units. Omit (or "auto") to let the
         # driver pick a bright default — the SC202CS powers up at its minimum
@@ -159,6 +169,13 @@ CONFIG_SCHEMA = cv.Schema(
 
 
 def _final_validate(config):
+    if config[CONF_H264_STREAM] and (
+        not config.get(CONF_H264_USERNAME) or not config.get(CONF_H264_PASSWORD)
+    ):
+        raise cv.Invalid(
+            "h264_stream requires h264_username and h264_password (reuse the "
+            "web_server credentials)"
+        )
     # Unlike person_detect (SoC-agnostic), this backend is P4-only silicon: it
     # uses the MIPI-CSI controller, the ISP, and the PPA, none of which exist on
     # other ESP32s. Fail with a clear message instead of an obscure build error.
@@ -213,6 +230,11 @@ async def to_code(config):
     cg.add(var.set_snapshot(config[CONF_SNAPSHOT]))
     cg.add(var.set_mjpeg_stream(config[CONF_MJPEG_STREAM]))
     cg.add(var.set_auto_white_balance(config[CONF_AUTO_WHITE_BALANCE]))
+    cg.add(var.set_h264_stream(config[CONF_H264_STREAM]))
+    if config[CONF_H264_STREAM]:
+        credentials = f"{config[CONF_H264_USERNAME]}:{config[CONF_H264_PASSWORD]}"
+        auth = "Basic " + base64.b64encode(credentials.encode()).decode()
+        cg.add(var.set_h264_auth(auth))
     # -1 => auto (driver picks a bright default) for exposure/gain.
     exposure = config[CONF_EXPOSURE]
     cg.add(var.set_exposure(-1 if exposure == "auto" else exposure))
@@ -229,6 +251,8 @@ async def to_code(config):
     add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE", True)
     add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE", True)
     add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER", True)
+    if config[CONF_H264_STREAM]:
+        add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_HW_H264_VIDEO_DEVICE", True)
     if config[CONF_SENSOR] == SENSOR_SC2356:
         # Enable the SC202CS driver AND its MIPI auto-detect: esp_video_init only
         # probes sensors whose auto-detect fn is registered, so without this no

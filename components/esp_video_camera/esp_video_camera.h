@@ -20,10 +20,12 @@
 #endif
 
 #include <atomic>
+#include <string>
 #include <vector>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "driver/ppa.h"
 
@@ -87,6 +89,8 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   void set_snapshot(bool enabled) { this->snapshot_enabled_ = enabled; }
   void set_mjpeg_stream(bool enabled) { this->mjpeg_stream_enabled_ = enabled; }
   void set_auto_white_balance(bool enabled) { this->awb_enabled_ = enabled; }
+  void set_h264_stream(bool enabled) { this->h264_enabled_ = enabled; }
+  void set_h264_auth(const std::string &auth) { this->h264_auth_ = auth; }
 
   // Blocking, for the HTTP task: waits for the detector's next acquire() to
   // JPEG-encode its frame. The buffer stays valid until the next request.
@@ -108,6 +112,20 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   // doesn't take (and some ISP paths drift exposure), so acquire() calls this
   // periodically so a missed/drifted value self-corrects. Silent.
   void reassert_controls_();
+
+  // Optional H.264/RTSP path. A low-priority camera task is the sole V4L2
+  // reader; detector requests are serviced before stream frames.
+  bool setup_h264_();
+  bool convert_frame_(const void *input, void *output, size_t output_size,
+                      uint16_t width, uint16_t height, ppa_srm_color_mode_t mode,
+                      float scale_x, float scale_y);
+  void capture_task_();
+  static void capture_task_entry_(void *arg);
+  void rtsp_task_();
+  static void rtsp_task_entry_(void *arg);
+  bool encode_h264_();
+  bool send_rtsp_(int fd, const char *data, size_t len);
+  void send_h264_rtp_(const uint8_t *data, size_t len);
 
   // Config
   int sccb_sda_{-1};
@@ -133,6 +151,8 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   uint8_t fb_count_{2};
   int exposure_{-1};  // raw sensor exposure; -1 = auto-pick a bright default
   int gain_{-1};      // raw sensor gain;     -1 = auto-pick a moderate default
+  bool h264_enabled_{false};
+  std::string h264_auth_;
 
   // The exposure/gain we actually applied, re-asserted periodically by acquire().
   uint32_t applied_exp_cid_{0};
@@ -143,7 +163,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
 
   // Runtime
   bool ready_{false};
-  bool streaming_{false};
+  std::atomic<bool> streaming_{false};
   int fd_{-1};
 
   struct MappedBuffer {
@@ -161,6 +181,29 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
 
   uint32_t capture_failures_{0};
   uint32_t last_ppa_us_{0};
+
+  // H.264 encoder and single-client RTSP server (all dormant unless opted in).
+  bool task_mode_{false};  // camera task owns V4L2 (any live stream enabled)
+  bool h264_ready_{false};
+  int h264_fd_{-1};
+  uint8_t *h264_yuv_{nullptr};
+  size_t h264_yuv_size_{0};
+  uint8_t *h264_output_{nullptr};
+  size_t h264_output_size_{0};
+  uint16_t h264_w_{0};
+  uint16_t h264_h_{0};
+  TaskHandle_t capture_task_handle_{nullptr};
+  TaskHandle_t rtsp_task_handle_{nullptr};
+  SemaphoreHandle_t frame_done_{nullptr};
+  SemaphoreHandle_t rtsp_send_mutex_{nullptr};
+  std::atomic<bool> stream_requested_{false};
+  std::atomic<bool> frame_requested_{false};
+  std::atomic<bool> frame_in_use_{false};
+  std::atomic<bool> rtsp_playing_{false};
+  std::atomic<int> rtsp_client_fd_{-1};
+  uint16_t rtp_sequence_{0};
+  uint32_t rtp_timestamp_{0};
+  int64_t last_h264_us_{0};
 
   // Gray-world white balance applied to a JPEG-only copy.
   bool awb_enabled_{false};
