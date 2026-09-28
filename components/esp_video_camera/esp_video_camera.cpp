@@ -255,9 +255,12 @@ void EspVideoCamera::setup() {
   // stream gets fresh frames instead of the detector's interval.
   if (this->h264_enabled_ || this->mjpeg_stream_enabled_) {
     this->frame_done_ = xSemaphoreCreateBinary();
-    this->task_mode_ = this->frame_done_ != nullptr &&
-        xTaskCreatePinnedToCore(&EspVideoCamera::capture_task_entry_, "camera_stream", 8192, this,
-                                1, &this->capture_task_handle_, 1) == pdPASS;
+    // Set before the task starts: it may run immediately on the other core and
+    // exits if it sees task_mode_ false.
+    this->task_mode_ = this->frame_done_ != nullptr;
+    if (this->task_mode_)
+      this->task_mode_ = xTaskCreatePinnedToCore(&EspVideoCamera::capture_task_entry_, "camera_stream",
+                                                 8192, this, 1, &this->capture_task_handle_, 1) == pdPASS;
     if (!this->task_mode_)
       ESP_LOGW(TAG, "camera task unavailable; streams follow the detector interval");
   }
@@ -764,6 +767,7 @@ void EspVideoCamera::capture_task_entry_(void *arg) {
 }
 
 void EspVideoCamera::capture_task_() {
+  ESP_LOGI(TAG, "camera task running (task_mode=%s)", YESNO(this->task_mode_));
   bool camera_on = false;
   for (;;) {
     if (!this->task_mode_)
@@ -806,6 +810,7 @@ void EspVideoCamera::capture_task_() {
       continue;
     }
 
+    this->task_frames_++;
     void *raw = this->buffers_[buf.index].start;
     const bool need_rgb = !this->frame_in_use_.load() &&
                           (this->frame_requested_.load() || this->snapshot_requested_.load());
@@ -1160,6 +1165,9 @@ void EspVideoCamera::dump_config() {
     ESP_LOGCONFIG(TAG, "  Last PPA rotate: %u us", (unsigned) this->last_ppa_us_);
   }
   ESP_LOGCONFIG(TAG, "  Capture failures: %u", (unsigned) this->capture_failures_);
+  if (this->task_mode_)
+    ESP_LOGCONFIG(TAG, "  Camera task: %s, %u frames", this->capture_task_handle_ ? "running" : "EXITED",
+                  (unsigned) this->task_frames_.load());
   if (this->h264_enabled_) {
     ESP_LOGCONFIG(TAG, "  H.264 RTSP: %s, %ux%u, port 8554, Basic auth",
                   this->h264_ready_ ? "ready" : "unavailable", this->h264_w_, this->h264_h_);
