@@ -133,7 +133,9 @@ struct StopEpochLatch {
 };
 
 // Lock-free 3-state handoff between one detector consumer and camera_stream so
-// timeout or privacy-off at any interleaving can never strand IN_USE.
+// timeout or privacy-off at any interleaving can never strand IN_USE, and a
+// pre-stop producer capture at epoch N can never deliver into a post-restart
+// consumer request at epoch N+1.
 class FrameHandoff {
  public:
   enum State : uint8_t {
@@ -142,52 +144,72 @@ class FrameHandoff {
     IN_USE = 2,
   };
 
-  State state() const { return this->state_.load(); }
-  bool is_requested() const { return this->state_.load() == REQUESTED; }
-  bool is_in_use() const { return this->state_.load() == IN_USE; }
+  State state() const { return unpack_state_(this->packed_.load()); }
+  uint32_t epoch() const { return unpack_epoch_(this->packed_.load()); }
+  bool is_requested() const { return this->state() == REQUESTED; }
+  bool is_requested_for(uint32_t capture_epoch) const {
+    return this->packed_.load() == pack_(capture_epoch, REQUESTED);
+  }
+  bool is_in_use() const { return this->state() == IN_USE; }
 
-  bool request() {
-    State expected = IDLE;
-    return this->state_.compare_exchange_strong(expected, REQUESTED);
+  bool request(uint32_t epoch) {
+    uint64_t expected = pack_(0, IDLE);
+    return this->packed_.compare_exchange_strong(expected, pack_(epoch, REQUESTED));
   }
 
-  bool deliver() {
-    State expected = REQUESTED;
-    return this->state_.compare_exchange_strong(expected, IN_USE);
+  bool deliver(uint32_t capture_epoch) {
+    uint64_t expected = pack_(capture_epoch, REQUESTED);
+    return this->packed_.compare_exchange_strong(expected, pack_(capture_epoch, IN_USE));
   }
 
-  // Consumer abort (timeout or privacy-off): cancel REQUESTED -> IDLE, or if
-  // producer already transitioned REQUESTED -> IN_USE, immediately release
-  // IN_USE -> IDLE.
-  void cancel_or_release() {
-    State expected = REQUESTED;
-    if (this->state_.compare_exchange_strong(expected, IDLE))
+  // Consumer abort (timeout or privacy-off): cancel (epoch, REQUESTED) -> IDLE,
+  // or if producer already transitioned (epoch, REQUESTED) -> (epoch, IN_USE),
+  // immediately release (epoch, IN_USE) -> IDLE without touching a newer epoch.
+  void cancel_or_release(uint32_t epoch) {
+    uint64_t expected = pack_(epoch, REQUESTED);
+    if (this->packed_.compare_exchange_strong(expected, pack_(0, IDLE)))
       return;
-    expected = IN_USE;
-    this->state_.compare_exchange_strong(expected, IDLE);
+    expected = pack_(epoch, IN_USE);
+    this->packed_.compare_exchange_strong(expected, pack_(0, IDLE));
   }
 
-  bool accept(bool stream_valid) {
-    if (stream_valid && this->state_.load() == IN_USE)
+  bool accept(uint32_t epoch, bool stream_valid = true) {
+    if (stream_valid && this->packed_.load() == pack_(epoch, IN_USE))
       return true;
-    this->cancel_or_release();
+    this->cancel_or_release(epoch);
     return false;
   }
 
   void release() {
-    State expected = IN_USE;
-    this->state_.compare_exchange_strong(expected, IDLE);
+    uint64_t cur = this->packed_.load();
+    while (unpack_state_(cur) == IN_USE) {
+      if (this->packed_.compare_exchange_weak(cur, pack_(0, IDLE)))
+        return;
+    }
   }
 
   // Stop helper: cancel an unclaimed REQUESTED -> IDLE without touching IN_USE
   // (which belongs to an active detector inference pass until release()).
   void cancel_request() {
-    State expected = REQUESTED;
-    this->state_.compare_exchange_strong(expected, IDLE);
+    uint64_t cur = this->packed_.load();
+    while (unpack_state_(cur) == REQUESTED) {
+      if (this->packed_.compare_exchange_weak(cur, pack_(0, IDLE)))
+        return;
+    }
   }
 
  private:
-  std::atomic<State> state_{IDLE};
+  static constexpr uint64_t pack_(uint32_t epoch, State state) {
+    return (static_cast<uint64_t>(epoch) << 2) | static_cast<uint64_t>(state);
+  }
+  static constexpr State unpack_state_(uint64_t packed) {
+    return static_cast<State>(packed & 0x3u);
+  }
+  static constexpr uint32_t unpack_epoch_(uint64_t packed) {
+    return static_cast<uint32_t>(packed >> 2);
+  }
+
+  std::atomic<uint64_t> packed_{0};
 };
 
 }  // namespace esp_video_camera

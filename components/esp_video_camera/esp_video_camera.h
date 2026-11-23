@@ -139,9 +139,9 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   static void capture_task_entry_(void *arg);
   void rtsp_task_();
   static void rtsp_task_entry_(void *arg);
-  bool encode_h264_();
+  bool encode_h264_(uint32_t capture_epoch);
   bool send_rtsp_(int fd, const char *data, size_t len);
-  void send_h264_rtp_(const uint8_t *data, size_t len);
+  void send_h264_rtp_(const uint8_t *data, size_t len, uint32_t capture_epoch);
 
   bool ensure_jpeg_encoder_();
   bool ensure_stream_rgb_();
@@ -200,9 +200,12 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   bool ready_{false};
   std::atomic<bool> streaming_{false};
   std::atomic<uint32_t> stop_epoch_{0};
-  bool v4l2_active_{false};      // guarded by v4l2_mutex_ in non-task mode
+  bool v4l2_active_{false};            // guarded by v4l2_mutex_ in non-task mode
+  bool non_task_stop_pending_{false};  // guarded by v4l2_mutex_ in non-task mode
+  uint32_t streamoff_failures_{0};
   uint32_t queued_mask_{0};      // bitmask of MMAP buffers currently queued via QBUF
   SemaphoreHandle_t v4l2_mutex_{nullptr};
+  SemaphoreHandle_t sock_mutex_{nullptr};  // guards active HTTP/RTSP sockfds for shutdown()
   int fd_{-1};
 
   struct MappedBuffer {
@@ -231,6 +234,8 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   bool task_mode_{false};
   std::atomic<uint32_t> task_frames_{0};  // camera task owns V4L2 (any live stream enabled)
   bool h264_ready_{false};
+  bool h264_out_queued_{false};
+  bool h264_cap_queued_{false};
   int h264_fd_{-1};
   uint8_t *h264_yuv_{nullptr};
   size_t h264_yuv_size_{0};
@@ -281,8 +286,8 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   QueueHandle_t mjpeg_req_queue_{nullptr};
   TaskHandle_t mjpeg_worker_handle_{nullptr};
   std::atomic<bool> mjpeg_client_active_{false};
-  SemaphoreHandle_t mjpeg_sock_mutex_{nullptr};
   int mjpeg_active_sockfd_{-1};
+  int snapshot_active_sockfd_{-1};
 #endif
 };
 

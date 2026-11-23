@@ -171,64 +171,89 @@ int main() {
   assert(latch.handled_epoch == stop_epoch);
   assert(!StopEpochLatch::session_valid(viewer2_epoch, stop_epoch, true));
 
-  // 6. FrameHandoff: every interleaving of normal handoff, timeout, and stop
-  //    never strands IN_USE.
+  // 6. FrameHandoff: every interleaving of normal handoff, timeout, stop, and
+  //    rapid OFF/ON epoch transition never strands IN_USE or leaks pre-stop frames.
   FrameHandoff hf{};
   assert(hf.state() == FrameHandoff::IDLE);
 
-  // 6a. Normal handoff: IDLE -> REQUESTED -> IN_USE -> IDLE.
-  assert(hf.request());
-  assert(hf.is_requested() && !hf.is_in_use());
-  assert(!hf.request());  // cannot double-request
-  assert(hf.deliver());
-  assert(hf.is_in_use() && !hf.is_requested());
-  assert(!hf.deliver());  // cannot double-deliver
-  assert(hf.accept(true));
+  // 6a. Normal handoff: IDLE -> (1, REQUESTED) -> (1, IN_USE) -> IDLE.
+  assert(hf.request(1));
+  assert(hf.is_requested() && hf.is_requested_for(1) && !hf.is_requested_for(2) && !hf.is_in_use());
+  assert(!hf.request(1));  // cannot double-request
+  assert(!hf.deliver(2));  // wrong capture epoch cannot deliver
+  assert(hf.deliver(1));
+  assert(hf.is_in_use() && hf.epoch() == 1 && !hf.is_requested());
+  assert(!hf.deliver(1));  // cannot double-deliver
+  assert(hf.accept(1));
   assert(hf.is_in_use());
   hf.release();
   assert(hf.state() == FrameHandoff::IDLE);
 
-  // 6b. Timeout BEFORE deliver: consumer cancels REQUESTED -> IDLE; late deliver fails.
-  assert(hf.request());
-  hf.cancel_or_release();
+  // 6b. Timeout BEFORE deliver: consumer cancels (2, REQUESTED) -> IDLE; late deliver fails.
+  assert(hf.request(2));
+  hf.cancel_or_release(2);
   assert(hf.state() == FrameHandoff::IDLE);
-  assert(!hf.deliver());
+  assert(!hf.deliver(2));
   assert(hf.state() == FrameHandoff::IDLE);
 
-  // 6c. Timeout RIGHT AFTER deliver: producer moved REQUESTED -> IN_USE, consumer
-  //     timed out and calls cancel_or_release() -> transitions IN_USE -> IDLE!
-  assert(hf.request());
-  assert(hf.deliver());
+  // 6c. Timeout RIGHT AFTER deliver: producer moved (3, REQUESTED) -> (3, IN_USE),
+  //     consumer timed out and calls cancel_or_release(3) -> transitions IN_USE -> IDLE!
+  assert(hf.request(3));
+  assert(hf.deliver(3));
   assert(hf.is_in_use());
-  hf.cancel_or_release();
+  hf.cancel_or_release(3);
   assert(hf.state() == FrameHandoff::IDLE);
 
   // 6d. Stop BEFORE deliver: wake_all_waiters_ cancels REQUESTED -> IDLE;
-  //     producer deliver fails; consumer accept(false) leaves IDLE.
-  assert(hf.request());
+  //     producer deliver fails; consumer accept(4, false) leaves IDLE.
+  assert(hf.request(4));
   hf.cancel_request();
   assert(hf.state() == FrameHandoff::IDLE);
-  assert(!hf.deliver());
-  assert(!hf.accept(false));
+  assert(!hf.deliver(4));
+  assert(!hf.accept(4, false));
   assert(hf.state() == FrameHandoff::IDLE);
 
   // 6e. Stop AFTER deliver before consumer checks stream_valid:
   //     cancel_request() preserves IN_USE (so active inference isn't clobbered),
-  //     then consumer accept(false) immediately releases IN_USE -> IDLE!
-  assert(hf.request());
-  assert(hf.deliver());
+  //     then consumer accept(5, false) immediately releases IN_USE -> IDLE!
+  assert(hf.request(5));
+  assert(hf.deliver(5));
   hf.cancel_request();
   assert(hf.is_in_use());
-  assert(!hf.accept(false));
+  assert(!hf.accept(5, false));
   assert(hf.state() == FrameHandoff::IDLE);
 
   // 6f. Stop DURING active inference: cancel_request() preserves IN_USE until
   //     detector finishes and calls release().
-  assert(hf.request());
-  assert(hf.deliver());
-  assert(hf.accept(true));
+  assert(hf.request(6));
+  assert(hf.deliver(6));
+  assert(hf.accept(6, true));
   hf.cancel_request();
   assert(hf.is_in_use());
+  hf.release();
+  assert(hf.state() == FrameHandoff::IDLE);
+
+  // 6g. Rapid OFF/ON epoch race: producer captures at epoch N while consumer A
+  //     requested at epoch N. Privacy OFF cancels (N, REQUESTED) -> IDLE, then
+  //     privacy ON admits consumer B at epoch N+1. Producer's late deliver(N)
+  //     MUST fail and MUST NOT deliver the pre-stop frame to consumer B; stale
+  //     consumer A's cancel_or_release(N) MUST NOT disturb consumer B either.
+  constexpr uint32_t epoch_n = 10;
+  constexpr uint32_t epoch_next = epoch_n + 1;
+  assert(hf.request(epoch_n));
+  hf.cancel_request();  // privacy OFF
+  assert(hf.state() == FrameHandoff::IDLE);
+  assert(hf.request(epoch_next));  // privacy ON + new consumer B
+  assert(!hf.deliver(epoch_n));    // pre-stop producer at epoch N is rejected!
+  assert(hf.state() == FrameHandoff::REQUESTED && hf.epoch() == epoch_next);
+  hf.cancel_or_release(epoch_n);   // late abort from consumer A cannot touch N+1
+  assert(hf.state() == FrameHandoff::REQUESTED && hf.epoch() == epoch_next);
+  assert(!hf.accept(epoch_n, true));
+  assert(hf.state() == FrameHandoff::REQUESTED && hf.epoch() == epoch_next);
+  // Post-restart producer at epoch N+1 delivers cleanly to consumer B.
+  assert(hf.deliver(epoch_next));
+  assert(hf.accept(epoch_next));
+  assert(hf.is_in_use() && hf.epoch() == epoch_next);
   hf.release();
   assert(hf.state() == FrameHandoff::IDLE);
 
