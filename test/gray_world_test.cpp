@@ -35,10 +35,11 @@ int main() {
 
   // 2. Pure black frame: no div-by-zero, stays black, does not seed state.
   fill_bgr(src, 0, 0, 0);
-  GrayWorldState state{};
-  gray_world_copy(src.data(), dst.data(), n, state);
+  gray_world_copy(src.data(), dst.data(), n);
   for (auto v : dst)
     assert(v == 0);
+  GrayWorldState state{};
+  gray_world_update_gains(src.data(), n, state);
   assert(!state.initialized);
   assert(state.kr == GRAY_WORLD_UNITY_GAIN && state.kb == GRAY_WORLD_UNITY_GAIN);
 
@@ -103,13 +104,13 @@ int main() {
   gray_world_build_lut(512, lut);  // 2.0x
   assert(lut[0] == 0 && lut[64] == 128 && lut[128] == 255 && lut[255] == 255);
 
-  // 7. In-place matches out-of-place byte-for-byte on identical initial state.
+  // 7. In-place matches out-of-place byte-for-byte on fresh initial state.
   fill_bgr(src, 95, 110, 150);
-  GrayWorldState s1{}, s2{};
+  GrayWorldState s2{};
   std::vector<uint8_t> ip = src;
-  gray_world_copy(src.data(), dst.data(), n, s1);
+  gray_world_copy(src.data(), dst.data(), n);
   gray_world_apply_inplace(ip.data(), n, s2);
-  assert(s1.kr == s2.kr && s1.kb == s2.kb && dst == ip);
+  assert(s2.initialized && dst == ip);
 
   return 0;
 }

@@ -6,9 +6,12 @@
 
 #include "esp_video_camera/mjpeg.h"
 
+using esphome::esp_video_camera::FrameHandoff;
 using esphome::esp_video_camera::JpegRequestState;
 using esphome::esp_video_camera::MJPEG_PART_HEADROOM;
 using esphome::esp_video_camera::MJPEG_PART_TAILROOM;
+using esphome::esp_video_camera::StopEpochLatch;
+using esphome::esp_video_camera::StreamLifecycleAction;
 using esphome::esp_video_camera::format_mjpeg_part;
 using esphome::esp_video_camera::frame_mjpeg_in_place;
 using esphome::esp_video_camera::mjpeg_half_resolution;
@@ -59,15 +62,19 @@ int main() {
   assert(!frame_mjpeg_in_place(jpeg_buf, MJPEG_PART_HEADROOM, sizeof(fake_jpeg), 1, framed, framed_len));
 
   // 4. JpegRequestState handshake: happy path, stale wakeup, privacy-off abort,
-  //    timeout/late-producer race, and encode failure (0 bytes).
+  //    timeout/late-producer A->B race, and encode failure (0 bytes).
   JpegRequestState st{};
-  // Producer cannot complete when nothing is pending.
-  assert(!st.complete_request(1000));
+  // Producer cannot claim or complete when nothing is pending.
+  assert(st.claim_request() == 0);
+  assert(!st.complete_request(0, 1000));
+  assert(!st.complete_request(1, 1000));
 
   // Happy path.
   uint32_t tok1 = st.begin_request();
   assert(st.pending);
-  assert(st.complete_request(24500));
+  uint32_t claim1 = st.claim_request();
+  assert(claim1 == tok1);
+  assert(st.complete_request(claim1, 24500));
   assert(!st.pending);
   size_t out_len = 0;
   assert(st.finish_wait(tok1, true, true, out_len));
@@ -86,15 +93,144 @@ int main() {
 
   // Consumer timeout clears pending so a late producer aborts cleanly.
   uint32_t tok4 = st.begin_request();
+  uint32_t claim4 = st.claim_request();
+  assert(claim4 == tok4);
   assert(!st.finish_wait(tok4, false, true, out_len));
   assert(out_len == 0 && !st.pending);
-  assert(!st.complete_request(12345));
+  assert(!st.complete_request(claim4, 12345));
+
+  // Late producer A -> B race: request A begins -> producer claims A -> A times out
+  // -> request B begins -> producer completes A -> B must NOT be completed with A's
+  // bytes and must remain pending until producer claims & completes B!
+  uint32_t tokA = st.begin_request();
+  uint32_t claimA = st.claim_request();
+  assert(claimA == tokA);
+  assert(!st.finish_wait(tokA, false, true, out_len));
+  assert(out_len == 0 && !st.pending);
+
+  uint32_t tokB = st.begin_request();
+  assert(tokB != tokA && st.pending);
+  assert(!st.complete_request(claimA, 11111));
+  assert(st.pending);
+  assert(st.done_gen != tokB);
+
+  uint32_t claimB = st.claim_request();
+  assert(claimB == tokB);
+  assert(st.complete_request(claimB, 22222));
+  assert(!st.pending);
+  assert(st.finish_wait(tokB, true, true, out_len));
+  assert(out_len == 22222);
 
   // Encode error (len == 0) wakes waiter and fails cleanly.
   uint32_t tok5 = st.begin_request();
-  assert(st.complete_request(0));
+  uint32_t claim5 = st.claim_request();
+  assert(st.complete_request(claim5, 0));
   assert(!st.finish_wait(tok5, true, true, out_len));
   assert(out_len == 0);
+
+  // 5. StopEpochLatch: rapid privacy OFF -> ON before capture_task_() observes OFF
+  //    must still force a full STOP and invalidate pre-stop HTTP viewer sessions.
+  StopEpochLatch latch{};
+  bool camera_on = false;
+  uint32_t stop_epoch = 0;
+
+  // Initial idle -> start -> run.
+  assert(latch.step(stop_epoch, false, camera_on) == StreamLifecycleAction::IDLE);
+  assert(latch.step(stop_epoch, true, camera_on) == StreamLifecycleAction::START);
+  camera_on = true;
+  assert(latch.step(stop_epoch, true, camera_on) == StreamLifecycleAction::RUN);
+  const uint32_t viewer_epoch = stop_epoch;
+  assert(StopEpochLatch::session_valid(viewer_epoch, stop_epoch, true));
+
+  // Rapid OFF -> ON toggle while camera_on is true: stop_epoch bumps, stream_requested
+  // is already back to true before capture_task_() wakes up.
+  ++stop_epoch;
+  assert(!StopEpochLatch::session_valid(viewer_epoch, stop_epoch, true));
+  assert(latch.step(stop_epoch, true, camera_on) == StreamLifecycleAction::STOP);
+
+  // If VIDIOC_STREAMOFF fails, camera_on remains true and handled_epoch does NOT advance,
+  // so the next loop iteration retries STOP instead of running or double-queuing.
+  assert(latch.step(stop_epoch, true, camera_on) == StreamLifecycleAction::STOP);
+
+  // Once VIDIOC_STREAMOFF succeeds, camera_on becomes false and handled_epoch advances;
+  // next step cleanly starts a fresh stream.
+  camera_on = false;
+  latch.mark_stopped(stop_epoch);
+  assert(latch.step(stop_epoch, true, camera_on) == StreamLifecycleAction::START);
+  camera_on = true;
+  assert(latch.step(stop_epoch, true, camera_on) == StreamLifecycleAction::RUN);
+
+  // New viewer opened after restart has a new epoch and is valid.
+  const uint32_t viewer2_epoch = stop_epoch;
+  assert(StopEpochLatch::session_valid(viewer2_epoch, stop_epoch, true));
+
+  // Privacy OFF while camera_on is false simply advances handled_epoch and stays IDLE.
+  camera_on = false;
+  ++stop_epoch;
+  assert(latch.step(stop_epoch, false, camera_on) == StreamLifecycleAction::IDLE);
+  assert(latch.handled_epoch == stop_epoch);
+  assert(!StopEpochLatch::session_valid(viewer2_epoch, stop_epoch, true));
+
+  // 6. FrameHandoff: every interleaving of normal handoff, timeout, and stop
+  //    never strands IN_USE.
+  FrameHandoff hf{};
+  assert(hf.state() == FrameHandoff::IDLE);
+
+  // 6a. Normal handoff: IDLE -> REQUESTED -> IN_USE -> IDLE.
+  assert(hf.request());
+  assert(hf.is_requested() && !hf.is_in_use());
+  assert(!hf.request());  // cannot double-request
+  assert(hf.deliver());
+  assert(hf.is_in_use() && !hf.is_requested());
+  assert(!hf.deliver());  // cannot double-deliver
+  assert(hf.accept(true));
+  assert(hf.is_in_use());
+  hf.release();
+  assert(hf.state() == FrameHandoff::IDLE);
+
+  // 6b. Timeout BEFORE deliver: consumer cancels REQUESTED -> IDLE; late deliver fails.
+  assert(hf.request());
+  hf.cancel_or_release();
+  assert(hf.state() == FrameHandoff::IDLE);
+  assert(!hf.deliver());
+  assert(hf.state() == FrameHandoff::IDLE);
+
+  // 6c. Timeout RIGHT AFTER deliver: producer moved REQUESTED -> IN_USE, consumer
+  //     timed out and calls cancel_or_release() -> transitions IN_USE -> IDLE!
+  assert(hf.request());
+  assert(hf.deliver());
+  assert(hf.is_in_use());
+  hf.cancel_or_release();
+  assert(hf.state() == FrameHandoff::IDLE);
+
+  // 6d. Stop BEFORE deliver: wake_all_waiters_ cancels REQUESTED -> IDLE;
+  //     producer deliver fails; consumer accept(false) leaves IDLE.
+  assert(hf.request());
+  hf.cancel_request();
+  assert(hf.state() == FrameHandoff::IDLE);
+  assert(!hf.deliver());
+  assert(!hf.accept(false));
+  assert(hf.state() == FrameHandoff::IDLE);
+
+  // 6e. Stop AFTER deliver before consumer checks stream_valid:
+  //     cancel_request() preserves IN_USE (so active inference isn't clobbered),
+  //     then consumer accept(false) immediately releases IN_USE -> IDLE!
+  assert(hf.request());
+  assert(hf.deliver());
+  hf.cancel_request();
+  assert(hf.is_in_use());
+  assert(!hf.accept(false));
+  assert(hf.state() == FrameHandoff::IDLE);
+
+  // 6f. Stop DURING active inference: cancel_request() preserves IN_USE until
+  //     detector finishes and calls release().
+  assert(hf.request());
+  assert(hf.deliver());
+  assert(hf.accept(true));
+  hf.cancel_request();
+  assert(hf.is_in_use());
+  hf.release();
+  assert(hf.state() == FrameHandoff::IDLE);
 
   return 0;
 }

@@ -128,28 +128,23 @@ inline void gray_world_apply_inplace(uint8_t *bgr, size_t pixels, GrayWorldState
   }
 }
 
-// Out-of-place LUT white balance for full-res snapshots so the detector's
-// rotated_ buffer is never mutated.
-inline void gray_world_copy(const uint8_t *src, uint8_t *dst, size_t pixels, GrayWorldState &state) {
+// Stateless out-of-place LUT white balance for on-demand full-res snapshots so
+// the detector's rotated_ buffer is never mutated.
+inline void gray_world_copy(const uint8_t *src, uint8_t *dst, size_t pixels) {
   if (src == nullptr || dst == nullptr || pixels == 0)
     return;
-  gray_world_update_gains(src, pixels, state);
+  GrayWorldState oneshot{};
+  gray_world_update_gains(src, pixels, oneshot);
   uint8_t lut_b[256];
   uint8_t lut_r[256];
-  gray_world_build_lut(state.kb, lut_b);
-  gray_world_build_lut(state.kr, lut_r);
+  gray_world_build_lut(oneshot.kb, lut_b);
+  gray_world_build_lut(oneshot.kr, lut_r);
   const size_t bytes = pixels * 3;
   for (size_t i = 0; i < bytes; i += 3) {
     dst[i] = lut_b[src[i]];
     dst[i + 1] = src[i + 1];
     dst[i + 2] = lut_r[src[i + 2]];
   }
-}
-
-// Stateless single-frame overload for on-demand snapshots.
-inline void gray_world_copy(const uint8_t *src, uint8_t *dst, size_t pixels) {
-  GrayWorldState oneshot{};
-  gray_world_copy(src, dst, pixels, oneshot);
 }
 
 }  // namespace esp_video_camera

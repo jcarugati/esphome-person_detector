@@ -111,10 +111,10 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   bool power_on_sensor_();
   bool open_and_configure_();
   bool setup_ppa_();
-  bool set_dqbuf_timeout_ms_(uint32_t timeout_ms);
+  bool set_dqbuf_timeout_(int fd, uint32_t timeout_ms);
   bool requeue_all_buffers_();
-  bool start_v4l2_stream_();
-  void stop_v4l2_stream_();
+  bool start_v4l2_stream_(uint32_t expected_epoch);
+  bool stop_v4l2_stream_();
   void wake_all_waiters_();
   // One-time gravity read → pick rotation so people are upright in the current
   // device orientation. Falls back to 0 (landscape) if no/unknown IMU.
@@ -145,15 +145,21 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
 
   bool ensure_jpeg_encoder_();
   bool ensure_stream_rgb_();
-  void encode_snapshot_();
-  void fail_snapshot_();
-  void encode_mjpeg_();
-  void fail_mjpeg_();
+  uint32_t claim_snapshot_request_();
+  void encode_snapshot_(uint32_t claimed_gen, uint32_t expected_epoch);
+  void fail_snapshot_(uint32_t claimed_gen);
+  uint32_t claim_mjpeg_request_();
+  void encode_mjpeg_(uint32_t claimed_gen, uint32_t expected_epoch);
+  void fail_mjpeg_(uint32_t claimed_gen);
 
 #ifdef USE_WEBSERVER
+  struct MjpegQueuedRequest {
+    httpd_req_t *req;
+    uint32_t session_epoch;
+  };
   void mjpeg_worker_task_();
   static void mjpeg_worker_entry_(void *arg);
-  void serve_mjpeg_client_(httpd_req_t *req);
+  void serve_mjpeg_client_(httpd_req_t *req, uint32_t session_epoch);
 #endif
 
   // Config
@@ -193,6 +199,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   // Runtime
   bool ready_{false};
   std::atomic<bool> streaming_{false};
+  std::atomic<uint32_t> stop_epoch_{0};
   bool v4l2_active_{false};      // guarded by v4l2_mutex_ in non-task mode
   uint32_t queued_mask_{0};      // bitmask of MMAP buffers currently queued via QBUF
   SemaphoreHandle_t v4l2_mutex_{nullptr};
@@ -203,7 +210,6 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
     size_t length{0};
   };
   std::vector<MappedBuffer> buffers_;
-  int dq_index_{-1};  // index of the buffer currently held by non-task acquire()
 
   ppa_client_handle_t ppa_{nullptr};
   void *rotated_{nullptr};   // PPA output: full-res upright RGB888 (PSRAM, cache-aligned)
@@ -237,8 +243,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   SemaphoreHandle_t frame_done_{nullptr};
   SemaphoreHandle_t rtsp_send_mutex_{nullptr};
   std::atomic<bool> stream_requested_{false};
-  std::atomic<bool> frame_requested_{false};
-  std::atomic<bool> frame_in_use_{false};
+  FrameHandoff frame_handoff_{};
   std::atomic<bool> rtsp_playing_{false};
   std::atomic<int> rtsp_client_fd_{-1};
   uint16_t rtp_sequence_{0};
@@ -276,6 +281,8 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   QueueHandle_t mjpeg_req_queue_{nullptr};
   TaskHandle_t mjpeg_worker_handle_{nullptr};
   std::atomic<bool> mjpeg_client_active_{false};
+  SemaphoreHandle_t mjpeg_sock_mutex_{nullptr};
+  int mjpeg_active_sockfd_{-1};
 #endif
 };
 
