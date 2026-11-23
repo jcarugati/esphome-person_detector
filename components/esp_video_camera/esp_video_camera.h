@@ -234,8 +234,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   bool task_mode_{false};
   std::atomic<uint32_t> task_frames_{0};  // camera task owns V4L2 (any live stream enabled)
   bool h264_ready_{false};
-  bool h264_out_queued_{false};
-  bool h264_cap_queued_{false};
+  H264BufferState h264_buf_state_{};
   int h264_fd_{-1};
   uint8_t *h264_yuv_{nullptr};
   size_t h264_yuv_size_{0};
@@ -251,6 +250,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   FrameHandoff frame_handoff_{};
   std::atomic<bool> rtsp_playing_{false};
   std::atomic<int> rtsp_client_fd_{-1};
+  std::atomic<uint32_t> rtsp_session_gen_{0};
   uint16_t rtp_sequence_{0};
   uint32_t rtp_timestamp_{0};
   int64_t last_h264_us_{0};

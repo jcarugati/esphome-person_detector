@@ -135,7 +135,8 @@ struct StopEpochLatch {
 // Lock-free 3-state handoff between one detector consumer and camera_stream so
 // timeout or privacy-off at any interleaving can never strand IN_USE, and a
 // pre-stop producer capture at epoch N can never deliver into a post-restart
-// consumer request at epoch N+1.
+// consumer request at epoch N+1. Uses native 32-bit atomics (30-bit epoch +
+// 2-bit state) so it stays genuinely lock-free on 32-bit RISC-V (ESP32-P4).
 class FrameHandoff {
  public:
   enum State : uint8_t {
@@ -143,6 +144,10 @@ class FrameHandoff {
     REQUESTED = 1,
     IN_USE = 2,
   };
+
+  static constexpr uint32_t EPOCH_MASK = 0x3FFFFFFFu;
+  static_assert(std::atomic<uint32_t>::is_always_lock_free,
+                "FrameHandoff requires native lock-free 32-bit atomics");
 
   State state() const { return unpack_state_(this->packed_.load()); }
   uint32_t epoch() const { return unpack_epoch_(this->packed_.load()); }
@@ -153,12 +158,12 @@ class FrameHandoff {
   bool is_in_use() const { return this->state() == IN_USE; }
 
   bool request(uint32_t epoch) {
-    uint64_t expected = pack_(0, IDLE);
+    uint32_t expected = pack_(0, IDLE);
     return this->packed_.compare_exchange_strong(expected, pack_(epoch, REQUESTED));
   }
 
   bool deliver(uint32_t capture_epoch) {
-    uint64_t expected = pack_(capture_epoch, REQUESTED);
+    uint32_t expected = pack_(capture_epoch, REQUESTED);
     return this->packed_.compare_exchange_strong(expected, pack_(capture_epoch, IN_USE));
   }
 
@@ -166,7 +171,7 @@ class FrameHandoff {
   // or if producer already transitioned (epoch, REQUESTED) -> (epoch, IN_USE),
   // immediately release (epoch, IN_USE) -> IDLE without touching a newer epoch.
   void cancel_or_release(uint32_t epoch) {
-    uint64_t expected = pack_(epoch, REQUESTED);
+    uint32_t expected = pack_(epoch, REQUESTED);
     if (this->packed_.compare_exchange_strong(expected, pack_(0, IDLE)))
       return;
     expected = pack_(epoch, IN_USE);
@@ -181,7 +186,7 @@ class FrameHandoff {
   }
 
   void release() {
-    uint64_t cur = this->packed_.load();
+    uint32_t cur = this->packed_.load();
     while (unpack_state_(cur) == IN_USE) {
       if (this->packed_.compare_exchange_weak(cur, pack_(0, IDLE)))
         return;
@@ -191,7 +196,7 @@ class FrameHandoff {
   // Stop helper: cancel an unclaimed REQUESTED -> IDLE without touching IN_USE
   // (which belongs to an active detector inference pass until release()).
   void cancel_request() {
-    uint64_t cur = this->packed_.load();
+    uint32_t cur = this->packed_.load();
     while (unpack_state_(cur) == REQUESTED) {
       if (this->packed_.compare_exchange_weak(cur, pack_(0, IDLE)))
         return;
@@ -199,17 +204,43 @@ class FrameHandoff {
   }
 
  private:
-  static constexpr uint64_t pack_(uint32_t epoch, State state) {
-    return (static_cast<uint64_t>(epoch) << 2) | static_cast<uint64_t>(state);
+  static constexpr uint32_t pack_(uint32_t epoch, State state) {
+    return ((epoch & EPOCH_MASK) << 2) | static_cast<uint32_t>(state);
   }
-  static constexpr State unpack_state_(uint64_t packed) {
+  static constexpr State unpack_state_(uint32_t packed) {
     return static_cast<State>(packed & 0x3u);
   }
-  static constexpr uint32_t unpack_epoch_(uint64_t packed) {
-    return static_cast<uint32_t>(packed >> 2);
+  static constexpr uint32_t unpack_epoch_(uint32_t packed) {
+    return packed >> 2;
   }
 
-  std::atomic<uint64_t> packed_{0};
+  std::atomic<uint32_t> packed_{0};
+};
+
+// Pure buffer-ownership tracker for the single-buffer V4L2 M2M H.264 path so
+// partial DQBUF timeouts (either CAPTURE or OUTPUT succeeding alone) stay in
+// recovery until both sides return to ready state.
+struct H264BufferState {
+  bool out_queued{false};
+  bool cap_queued{false};
+  bool cap_pending{false};
+
+  bool needs_recovery() const { return this->out_queued || this->cap_pending || !this->cap_queued; }
+  void reset() {
+    this->out_queued = false;
+    this->cap_queued = false;
+    this->cap_pending = false;
+  }
+  void on_cap_queued() { this->cap_queued = true; }
+  void on_out_queued() {
+    this->out_queued = true;
+    this->cap_pending = true;
+  }
+  void on_cap_dequeued() {
+    this->cap_queued = false;
+    this->cap_pending = false;
+  }
+  void on_out_dequeued() { this->out_queued = false; }
 };
 
 }  // namespace esp_video_camera

@@ -583,8 +583,7 @@ bool EspVideoCamera::setup_h264_() {
       this->h264_yuv_ = nullptr;
       this->h264_yuv_size_ = 0;
     }
-    this->h264_out_queued_ = false;
-    this->h264_cap_queued_ = false;
+    this->h264_buf_state_.reset();
     return false;
   };
 
@@ -638,8 +637,8 @@ bool EspVideoCamera::setup_h264_() {
     return cleanup();
   if (xioctl(this->h264_fd_, VIDIOC_QBUF, &buf) != 0)
     return cleanup();
-  this->h264_cap_queued_ = true;
-  this->h264_out_queued_ = false;
+  this->h264_buf_state_.reset();
+  this->h264_buf_state_.on_cap_queued();
   if (!this->set_dqbuf_timeout_(this->h264_fd_, 200)) {
     ESP_LOGW(TAG, "H.264 VIDIOC_S_DQBUF_TIMEOUT failed: %s; refusing unbounded DQBUF",
              strerror(errno));
@@ -1145,7 +1144,7 @@ void EspVideoCamera::capture_task_() {
     bool do_h264 = false;
     const int64_t now = esp_timer_get_time();
     if (this->h264_ready_ && this->rtsp_playing_.load() && now - this->last_h264_us_ >= 100000) {
-      if (this->h264_out_queued_ || !this->h264_cap_queued_) {
+      if (this->h264_buf_state_.needs_recovery()) {
         this->last_h264_us_ = now;
         do_h264 = true;
       } else if (this->convert_frame_(raw, this->h264_yuv_, this->h264_yuv_size_,
@@ -1190,35 +1189,35 @@ void EspVideoCamera::capture_task_() {
 }
 
 bool EspVideoCamera::encode_h264_(uint32_t capture_epoch) {
-  if (this->h264_out_queued_ || !this->h264_cap_queued_) {
-    // Reclaim stale H.264 buffers left behind by a previous VIDIOC_DQBUF timeout
-    // (esp_video 2.2.0 returns EPERM on timeout; QBUF would fail with EINVAL
-    // until the driver-owned buffer is dequeued).
-    if (this->h264_cap_queued_) {
+  if (this->h264_buf_state_.needs_recovery()) {
+    // Reclaim stale H.264 buffers left behind by a previous partial DQBUF timeout
+    // (esp_video 2.2.0 returns EPERM on timeout; QBUF fails with EINVAL until
+    // both CAPTURE and OUTPUT return to the ready state).
+    if (this->h264_buf_state_.cap_pending && this->h264_buf_state_.cap_queued) {
       struct v4l2_buffer stale = {};
       stale.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       stale.memory = V4L2_MEMORY_MMAP;
       if (xioctl(this->h264_fd_, VIDIOC_DQBUF, &stale) == 0) {
-        this->h264_cap_queued_ = false;
+        this->h264_buf_state_.on_cap_dequeued();
         if (xioctl(this->h264_fd_, VIDIOC_QBUF, &stale) == 0)
-          this->h264_cap_queued_ = true;
+          this->h264_buf_state_.on_cap_queued();
       }
-    } else {
+    } else if (!this->h264_buf_state_.cap_queued) {
       struct v4l2_buffer cap = {};
       cap.index = 0;
       cap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       cap.memory = V4L2_MEMORY_MMAP;
       if (xioctl(this->h264_fd_, VIDIOC_QBUF, &cap) == 0)
-        this->h264_cap_queued_ = true;
+        this->h264_buf_state_.on_cap_queued();
     }
-    if (this->h264_out_queued_) {
+    if (this->h264_buf_state_.out_queued) {
       struct v4l2_buffer done_out = {};
       done_out.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
       done_out.memory = V4L2_MEMORY_USERPTR;
       if (xioctl(this->h264_fd_, VIDIOC_DQBUF, &done_out) == 0)
-        this->h264_out_queued_ = false;
+        this->h264_buf_state_.on_out_dequeued();
     }
-    // h264_yuv_ was not refreshed while the previous OUTPUT buffer was in flight.
+    // h264_yuv_ was not refreshed while recovery was pending.
     return false;
   }
 
@@ -1234,21 +1233,24 @@ bool EspVideoCamera::encode_h264_(uint32_t capture_epoch) {
   out.bytesused = this->h264_yuv_size_;
   if (xioctl(this->h264_fd_, VIDIOC_QBUF, &out) != 0)
     return false;
-  this->h264_out_queued_ = true;
+  this->h264_buf_state_.on_out_queued();
 
-  // Bounded to 200 ms by mandatory VIDIOC_S_DQBUF_TIMEOUT in setup_h264_().
+  // VIDIOC_S_DQBUF_TIMEOUT (200 ms) bounds the V4L2 semaphore wait; note that
+  // esp_video 2.2.0 runs ESP_VIDEO_M2M_TRIGGER synchronously before that wait
+  // (up to the hardware driver's internal 1000-tick encode bound), which Phase 2
+  // removes when replacing V4L2 H.264 with direct esp_h264_enc_hw.
   struct v4l2_buffer encoded = {};
   encoded.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   encoded.memory = V4L2_MEMORY_MMAP;
   const bool got_encoded = xioctl(this->h264_fd_, VIDIOC_DQBUF, &encoded) == 0;
   if (got_encoded)
-    this->h264_cap_queued_ = false;
+    this->h264_buf_state_.on_cap_dequeued();
 
   struct v4l2_buffer done_out = {};
   done_out.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
   done_out.memory = V4L2_MEMORY_USERPTR;
   if (xioctl(this->h264_fd_, VIDIOC_DQBUF, &done_out) == 0)
-    this->h264_out_queued_ = false;
+    this->h264_buf_state_.on_out_dequeued();
 
   if (!got_encoded)
     return false;
@@ -1259,7 +1261,7 @@ bool EspVideoCamera::encode_h264_(uint32_t capture_epoch) {
   }
   if (xioctl(this->h264_fd_, VIDIOC_QBUF, &encoded) != 0)
     return false;
-  this->h264_cap_queued_ = true;
+  this->h264_buf_state_.on_cap_queued();
   return true;
 }
 
@@ -1280,7 +1282,14 @@ bool EspVideoCamera::send_rtsp_(int fd, const char *data, size_t len) {
 }
 
 void EspVideoCamera::send_h264_rtp_(const uint8_t *data, size_t len, uint32_t capture_epoch) {
-  const int fd = this->rtsp_client_fd_.load();
+  int fd = -1;
+  uint32_t session_gen = 0;
+  if (this->sock_mutex_ == nullptr)
+    return;
+  xSemaphoreTake(this->sock_mutex_, portMAX_DELAY);
+  fd = this->rtsp_client_fd_.load();
+  session_gen = this->rtsp_session_gen_.load();
+  xSemaphoreGive(this->sock_mutex_);
   if (fd < 0 || !this->rtsp_playing_.load() ||
       !this->streaming_.load() || this->stop_epoch_.load() != capture_epoch) {
     return;
@@ -1291,8 +1300,8 @@ void EspVideoCamera::send_h264_rtp_(const uint8_t *data, size_t len, uint32_t ca
       [&](const uint8_t *packet, size_t packet_len, bool) {
         if (!ok)
           return;
-        if (!this->rtsp_playing_.load() || !this->streaming_.load() ||
-            this->stop_epoch_.load() != capture_epoch) {
+        if (this->rtsp_session_gen_.load() != session_gen || !this->rtsp_playing_.load() ||
+            !this->streaming_.load() || this->stop_epoch_.load() != capture_epoch) {
           ok = false;
           return;
         }
@@ -1306,7 +1315,8 @@ void EspVideoCamera::send_h264_rtp_(const uint8_t *data, size_t len, uint32_t ca
           ok = false;
           return;
         }
-        if (this->rtsp_client_fd_.load() != fd || !this->rtsp_playing_.load() ||
+        if (this->rtsp_session_gen_.load() != session_gen ||
+            this->rtsp_client_fd_.load() != fd || !this->rtsp_playing_.load() ||
             !this->streaming_.load() || this->stop_epoch_.load() != capture_epoch) {
           xSemaphoreGive(this->rtsp_send_mutex_);
           ok = false;
@@ -1318,13 +1328,12 @@ void EspVideoCamera::send_h264_rtp_(const uint8_t *data, size_t len, uint32_t ca
       });
   this->rtp_timestamp_ += 9000;
   if (!ok) {
-    this->rtsp_playing_.store(false);
-    if (this->sock_mutex_ != nullptr) {
-      xSemaphoreTake(this->sock_mutex_, portMAX_DELAY);
-      if (this->rtsp_client_fd_.load() == fd)
-        shutdown(fd, SHUT_RDWR);
-      xSemaphoreGive(this->sock_mutex_);
+    xSemaphoreTake(this->sock_mutex_, portMAX_DELAY);
+    if (this->rtsp_session_gen_.load() == session_gen && this->rtsp_client_fd_.load() == fd) {
+      this->rtsp_playing_.store(false);
+      shutdown(fd, SHUT_RDWR);
     }
+    xSemaphoreGive(this->sock_mutex_);
   }
 }
 
@@ -1361,6 +1370,7 @@ void EspVideoCamera::rtsp_task_() {
     setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     xSemaphoreTake(this->sock_mutex_, portMAX_DELAY);
+    this->rtsp_session_gen_.fetch_add(1);
     this->rtsp_client_fd_.store(client);
     xSemaphoreGive(this->sock_mutex_);
     this->rtsp_playing_.store(false);

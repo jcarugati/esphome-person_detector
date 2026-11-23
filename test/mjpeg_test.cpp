@@ -257,5 +257,43 @@ int main() {
   hf.release();
   assert(hf.state() == FrameHandoff::IDLE);
 
+  // 7. H264BufferState: both orders of partial DQBUF timeout stay in recovery
+  //    until both CAPTURE and OUTPUT return to ready state.
+  esphome::esp_video_camera::H264BufferState h264{};
+  assert(h264.needs_recovery());  // initial: cap not queued
+  h264.on_cap_queued();
+  assert(!h264.needs_recovery());
+
+  // 7a. Normal encode cycle: QBUF(out) -> DQBUF(cap) -> DQBUF(out) -> QBUF(cap).
+  h264.on_out_queued();
+  assert(h264.needs_recovery());
+  h264.on_cap_dequeued();
+  h264.on_out_dequeued();
+  assert(h264.needs_recovery());  // cap not re-queued yet
+  h264.on_cap_queued();
+  assert(!h264.needs_recovery());
+
+  // 7b. Partial timeout order 1: CAPTURE DQBUF fails, OUTPUT DQBUF succeeds!
+  //     Must STILL require recovery because CAPTURE result is still pending.
+  h264.on_out_queued();
+  h264.on_out_dequeued();  // OUTPUT reclaimed, CAPTURE still pending
+  assert(!h264.out_queued && h264.cap_queued && h264.cap_pending);
+  assert(h264.needs_recovery());
+  // Recovery dequeues + re-queues CAPTURE -> back to ready.
+  h264.on_cap_dequeued();
+  assert(h264.needs_recovery());
+  h264.on_cap_queued();
+  assert(!h264.needs_recovery());
+
+  // 7c. Partial timeout order 2: CAPTURE DQBUF succeeds (re-queued), OUTPUT DQBUF fails.
+  h264.on_out_queued();
+  h264.on_cap_dequeued();
+  h264.on_cap_queued();
+  assert(h264.out_queued && h264.cap_queued && !h264.cap_pending);
+  assert(h264.needs_recovery());
+  // Recovery dequeues OUTPUT -> back to ready.
+  h264.on_out_dequeued();
+  assert(!h264.needs_recovery());
+
   return 0;
 }
