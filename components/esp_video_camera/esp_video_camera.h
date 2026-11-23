@@ -24,10 +24,17 @@
 #include <vector>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "driver/ppa.h"
+#ifdef USE_WEBSERVER
+#include <esp_http_server.h>
+#endif
+
+#include "gray_world.h"
+#include "mjpeg.h"
 
 namespace esphome {
 namespace esp_video_camera {
@@ -92,15 +99,23 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   void set_h264_stream(bool enabled) { this->h264_enabled_ = enabled; }
   void set_h264_auth(const std::string &auth) { this->h264_auth_ = auth; }
 
-  // Blocking, for the HTTP task: waits for the detector's next acquire() to
-  // JPEG-encode its frame. The buffer stays valid until the next request.
-  // False when the camera is idle (privacy switch off) or on timeout.
-  bool capture_jpeg(const uint8_t *&data, size_t &len, uint32_t timeout_ms);
+#ifdef USE_WEBSERVER
+  // HTTP endpoint handlers invoked from ESP-IDF's web_server_idf after auth.
+  // Snapshot responds synchronously under snapshot_buf_mutex_; MJPEG hands off
+  // an async httpd_req_t copy to a dedicated worker task so port 80 stays free.
+  void handle_snapshot_http(httpd_req_t *req);
+  void handle_mjpeg_http(httpd_req_t *req);
+#endif
 
  protected:
   bool power_on_sensor_();
   bool open_and_configure_();
   bool setup_ppa_();
+  bool set_dqbuf_timeout_ms_(uint32_t timeout_ms);
+  bool requeue_all_buffers_();
+  bool start_v4l2_stream_();
+  void stop_v4l2_stream_();
+  void wake_all_waiters_();
   // One-time gravity read → pick rotation so people are upright in the current
   // device orientation. Falls back to 0 (landscape) if no/unknown IMU.
   void detect_rotation_from_imu_();
@@ -113,8 +128,8 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   // periodically so a missed/drifted value self-corrects. Silent.
   void reassert_controls_();
 
-  // Optional H.264/RTSP path. A low-priority camera task is the sole V4L2
-  // reader; detector requests are serviced before stream frames.
+  // Optional H.264/RTSP and MJPEG paths. A dedicated camera task is the sole
+  // V4L2 reader whenever a live stream is enabled.
   bool setup_h264_();
   void start_h264_();
   bool convert_frame_(const void *input, void *output, size_t output_size,
@@ -127,6 +142,19 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   bool encode_h264_();
   bool send_rtsp_(int fd, const char *data, size_t len);
   void send_h264_rtp_(const uint8_t *data, size_t len);
+
+  bool ensure_jpeg_encoder_();
+  bool ensure_stream_rgb_();
+  void encode_snapshot_();
+  void fail_snapshot_();
+  void encode_mjpeg_();
+  void fail_mjpeg_();
+
+#ifdef USE_WEBSERVER
+  void mjpeg_worker_task_();
+  static void mjpeg_worker_entry_(void *arg);
+  void serve_mjpeg_client_(httpd_req_t *req);
+#endif
 
   // Config
   int sccb_sda_{-1};
@@ -165,6 +193,9 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   // Runtime
   bool ready_{false};
   std::atomic<bool> streaming_{false};
+  bool v4l2_active_{false};      // guarded by v4l2_mutex_ in non-task mode
+  uint32_t queued_mask_{0};      // bitmask of MMAP buffers currently queued via QBUF
+  SemaphoreHandle_t v4l2_mutex_{nullptr};
   int fd_{-1};
 
   struct MappedBuffer {
@@ -172,18 +203,25 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
     size_t length{0};
   };
   std::vector<MappedBuffer> buffers_;
-  int dq_index_{-1};  // index of the buffer currently held by acquire()
+  int dq_index_{-1};  // index of the buffer currently held by non-task acquire()
 
   ppa_client_handle_t ppa_{nullptr};
-  void *rotated_{nullptr};   // PPA output: upright RGB888 (PSRAM, cache-aligned)
+  void *rotated_{nullptr};   // PPA output: full-res upright RGB888 (PSRAM, cache-aligned)
   size_t rotated_size_{0};
   uint16_t out_w_{0};        // dims after rotation
   uint16_t out_h_{0};
 
+  // Dedicated half-resolution RGB888 buffer for /stream.mjpg (lazy PSRAM alloc),
+  // decoupled from person_detect's rotated_ buffer.
+  uint8_t *stream_rgb_{nullptr};
+  size_t stream_rgb_size_{0};
+  uint16_t stream_w_{0};
+  uint16_t stream_h_{0};
+
   uint32_t capture_failures_{0};
   uint32_t last_ppa_us_{0};
 
-  // H.264 encoder and single-client RTSP server (all dormant unless opted in).
+  // Camera task + H.264/RTSP state.
   bool task_mode_{false};
   std::atomic<uint32_t> task_frames_{0};  // camera task owns V4L2 (any live stream enabled)
   bool h264_ready_{false};
@@ -207,21 +245,38 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   uint32_t rtp_timestamp_{0};
   int64_t last_h264_us_{0};
 
-  // Gray-world white balance applied to a JPEG-only copy.
+  // Gray-world white balance: out-of-place scratch copy for full-res snapshots,
+  // EMA state for in-place balancing on stream_rgb_.
   bool awb_enabled_{false};
   uint8_t *balanced_{nullptr};
+  GrayWorldState mjpeg_awb_state_{};
+  std::atomic<bool> mjpeg_awb_reset_{true};
 
-  // JPEG: the frame owner (detector task) encodes on request, so the sensor
-  // keeps a single reader. ponytail: one waiter; httpd is single-task.
-  void encode_snapshot_();
+  // Shared HW JPEG encoder + independent mutex-protected snapshot and MJPEG buffers.
+  void *jpeg_encoder_{nullptr};
   bool snapshot_enabled_{false};
   bool mjpeg_stream_enabled_{false};
+
   std::atomic<bool> snapshot_requested_{false};
   SemaphoreHandle_t snapshot_done_{nullptr};
-  void *jpeg_encoder_{nullptr};
-  uint8_t *jpeg_buf_{nullptr};
-  size_t jpeg_buf_size_{0};
-  size_t jpeg_len_{0};
+  SemaphoreHandle_t snapshot_buf_mutex_{nullptr};
+  JpegRequestState snapshot_state_{};
+  uint8_t *snapshot_jpeg_buf_{nullptr};
+  size_t snapshot_jpeg_buf_size_{0};
+
+  std::atomic<bool> mjpeg_requested_{false};
+  SemaphoreHandle_t mjpeg_done_{nullptr};
+  SemaphoreHandle_t mjpeg_buf_mutex_{nullptr};
+  JpegRequestState mjpeg_state_{};
+  uint8_t *mjpeg_jpeg_raw_{nullptr};   // raw jpeg_alloc_encoder_mem pointer
+  uint8_t *mjpeg_jpeg_buf_{nullptr};   // raw + MJPEG_PART_HEADROOM (128B aligned)
+  size_t mjpeg_jpeg_buf_size_{0};
+
+#ifdef USE_WEBSERVER
+  QueueHandle_t mjpeg_req_queue_{nullptr};
+  TaskHandle_t mjpeg_worker_handle_{nullptr};
+  std::atomic<bool> mjpeg_client_active_{false};
+#endif
 };
 
 }  // namespace esp_video_camera

@@ -251,6 +251,7 @@ async def to_code(config):
     add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE", True)
     add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE", True)
     add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER", True)
+    add_idf_sdkconfig_option("CONFIG_ISP_PIPELINE_CONTROLLER_TASK_STACK_USE_PSRAM", True)
     if config[CONF_H264_STREAM]:
         add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_HW_H264_VIDEO_DEVICE", True)
     if config[CONF_SENSOR] == SENSOR_SC2356:
@@ -261,6 +262,8 @@ async def to_code(config):
         add_idf_sdkconfig_option(
             "CONFIG_CAMERA_SC202CS_AUTO_DETECT_MIPI_INTERFACE_SENSOR", True
         )
+        add_idf_sdkconfig_option("CONFIG_CAMERA_SC202CS_ANA_GAIN_PRIORITY", True)
+        add_idf_sdkconfig_option("CONFIG_CAMERA_SC202CS_DIG_GAIN_PRIORITY", False)
         add_idf_sdkconfig_option(mode_kconfig, True)
 
     cg.add_define("USE_ESP_VIDEO_CAMERA")
