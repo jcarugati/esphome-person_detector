@@ -10,6 +10,8 @@
 using esphome::esp_video_camera::H264Geometry;
 using esphome::esp_video_camera::H264SpropParams;
 using esphome::esp_video_camera::H264_RTP_INTERLEAVED_BUF_SIZE;
+using esphome::esp_video_camera::RTSP_IDLE_TIMEOUT_US;
+using esphome::esp_video_camera::RTSP_MEDIA_STALL_TIMEOUT_US;
 using esphome::esp_video_camera::base64_encode;
 using esphome::esp_video_camera::compute_h264_geometry;
 using esphome::esp_video_camera::constant_time_equals;
@@ -18,6 +20,8 @@ using esphome::esp_video_camera::format_rtsp_sdp;
 using esphome::esp_video_camera::packetize_h264_annex_b;
 using esphome::esp_video_camera::packetize_h264_annex_b_interleaved;
 using esphome::esp_video_camera::rtp_timestamp_90khz;
+using esphome::esp_video_camera::rtsp_session_timed_out;
+using esphome::esp_video_camera::rtsp_should_accept_replacement;
 
 struct Packet {
   std::vector<uint8_t> bytes;
@@ -76,7 +80,7 @@ int main() {
     assert(ipackets[i].marker == packets[i].marker);
   }
 
-  // Abort on 2nd packet stops immediately without emitting remaining packets.
+  // Abort on 2nd packet (single NAL) stops immediately without emitting remaining NALs.
   size_t emitted = 0;
   uint16_t aseq = 100;
   const bool aborted = packetize_h264_annex_b_interleaved(
@@ -88,6 +92,30 @@ int main() {
   assert(!aborted);
   assert(emitted == 2);
   assert(aseq == 102);
+
+  // Abort mid-FU-A fragmentation (2nd packet = first FU-A fragment of 3) stops
+  // immediately without emitting remaining FU-A fragments or subsequent NALs.
+  const uint8_t fu_then_nal[] = {
+      0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x1E, 0x99,
+      0, 0, 1, 0x65, 1, 2, 3, 4, 5, 6, 7,
+      0, 0, 1, 0x68, 0xCE, 0x3C, 0x80,
+  };
+  size_t fu_emitted = 0;
+  uint16_t fseq = 200;
+  const bool fu_aborted = packetize_h264_annex_b_interleaved(
+      fu_then_nal, sizeof(fu_then_nal), 9000, fseq, 5, 0, scratch.data(), scratch.size(),
+      [&](const uint8_t *framed, size_t, bool) {
+        ++fu_emitted;
+        if (fu_emitted == 2) {
+          assert((framed[4 + 12] & 0x1F) == 28);  // FU-A indicator
+          assert((framed[4 + 13] & 0x80) != 0);   // Start bit on first fragment
+          return false;                           // abort mid-FU-A
+        }
+        return true;
+      });
+  assert(!fu_aborted);
+  assert(fu_emitted == 2);
+  assert(fseq == 202);
 
   // Undersized scratch fails closed.
   assert(!packetize_h264_annex_b_interleaved(access_unit, sizeof(access_unit), 0, aseq, 100, 0,
@@ -158,6 +186,31 @@ int main() {
   assert(!constant_time_equals("Basic dXNlcjpwYXNz", "Basic dXNlcjpwYXN"));
   assert(!constant_time_equals("", "Basic dXNlcjpwYXNz"));
   assert(constant_time_equals("", ""));
+
+  // 7. RTSP connection replacement policy: never evict an authenticated or playing viewer.
+  assert(rtsp_should_accept_replacement(false, false, false));
+  assert(rtsp_should_accept_replacement(false, false, true));
+  assert(rtsp_should_accept_replacement(false, true, false));
+  assert(rtsp_should_accept_replacement(false, true, true));
+  assert(rtsp_should_accept_replacement(true, false, false));   // idle unauthenticated
+  assert(!rtsp_should_accept_replacement(true, false, true));   // authenticated non-playing
+  assert(!rtsp_should_accept_replacement(true, true, false));   // playing (defensive)
+  assert(!rtsp_should_accept_replacement(true, true, true));    // authenticated playing
+
+  // 8. RTSP session timeout policy (10 s idle non-playing + 5 s playing media stall).
+  const int64_t t0 = 100000000;
+  assert(!rtsp_session_timed_out(false, t0 + RTSP_IDLE_TIMEOUT_US - 1, t0, t0));
+  assert(rtsp_session_timed_out(false, t0 + RTSP_IDLE_TIMEOUT_US, t0, t0));
+  assert(rtsp_session_timed_out(false, t0 + RTSP_IDLE_TIMEOUT_US + 1, t0, t0));
+  // Non-playing ignores last_media_us (even if 0).
+  assert(!rtsp_session_timed_out(false, t0 + 1000000, t0, 0));
+
+  // Playing enforces >5 s media-progress watchdog even when control traffic is fresh.
+  assert(!rtsp_session_timed_out(true, t0 + RTSP_MEDIA_STALL_TIMEOUT_US - 1, t0, t0));
+  assert(!rtsp_session_timed_out(true, t0 + RTSP_MEDIA_STALL_TIMEOUT_US, t0, t0));
+  assert(rtsp_session_timed_out(true, t0 + RTSP_MEDIA_STALL_TIMEOUT_US + 1, t0 + RTSP_MEDIA_STALL_TIMEOUT_US, t0));
+  // Cross-core ordering where last_media_us is slightly ahead of now_us must not time out.
+  assert(!rtsp_session_timed_out(true, t0, t0, t0 + 5000));
 
   return 0;
 }

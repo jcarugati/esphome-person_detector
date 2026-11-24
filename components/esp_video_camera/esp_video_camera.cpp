@@ -59,8 +59,10 @@ static const char *const TAG = "esp_video_camera";
 static const char *const VIDEO_DEVICE = "/dev/video0";
 static constexpr uint32_t DQBUF_POLL_TIMEOUT_MS = 100;
 static constexpr uint32_t HTTP_CAPTURE_TIMEOUT_MS = 4000;
-static constexpr int64_t RTSP_IDLE_TIMEOUT_US = 10000000;
-static constexpr size_t H264_RTP_SCRATCH_ALLOC_SIZE = 1536;  // 128B-aligned >= 1416B
+static constexpr int64_t H264_RTP_FRAME_BUDGET_US = 100000;       // 100 ms per access unit
+static constexpr int64_t RTSP_CTRL_SNDTIMEO_US = 200000;          // 200 ms control send timeout
+static constexpr int64_t RTSP_CTRL_SEND_DEADLINE_US = 250000;     // 250 ms mutex + framing wait
+static constexpr size_t H264_RTP_SCRATCH_ALLOC_SIZE = 1536;       // 128B-aligned >= 1416B
 
 #ifdef USE_WEBSERVER
 static void send_http_503(httpd_req_t *req, const char *msg) {
@@ -275,21 +277,60 @@ void EspVideoCamera::setup() {
     if (!this->task_mode_)
       ESP_LOGW(TAG, "camera task unavailable; streams follow the detector interval");
   }
-  // Start only the lightweight RTSP listener at boot; the direct esp_h264
-  // hardware encoder and its buffers are allocated lazily on PLAY and freed
-  // immediately on TEARDOWN/disconnect/stop (0 B H.264 SRAM while idle).
+#ifdef USE_ESP_VIDEO_CAMERA_H264
+  // Bind the lightweight RTSP listener synchronously at boot before publishing
+  // h264_ready_; the direct esp_h264 hardware encoder and its buffers are
+  // allocated lazily on PLAY and freed immediately on TEARDOWN/disconnect/stop
+  // (0 B H.264 SRAM while idle).
   if (this->h264_enabled_ && this->task_mode_) {
+    bool rtsp_ok = false;
     this->rtsp_send_mutex_ = xSemaphoreCreateMutex();
-    if (this->rtsp_send_mutex_ != nullptr &&
-        xTaskCreatePinnedToCore(&EspVideoCamera::rtsp_task_entry_, "camera_rtsp", 6144, this, 1,
-                                &this->rtsp_task_handle_, 0) == pdPASS) {
-      this->h264_ready_ = true;
+    if (this->rtsp_send_mutex_ == nullptr) {
+      ESP_LOGW(TAG, "H.264: RTSP send mutex allocation failed; RTSP disabled");
+    } else {
+      int server = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+      if (server < 0) {
+        ESP_LOGW(TAG, "H.264: RTSP socket failed: %s; RTSP disabled", strerror(errno));
+      } else {
+        int one = 1;
+        setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in address = {};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(8554);
+        address.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(server, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
+            listen(server, 2) != 0) {
+          ESP_LOGW(TAG, "H.264: RTSP bind/listen on :8554 failed: %s; RTSP disabled",
+                   strerror(errno));
+          close(server);
+        } else {
+          this->rtsp_server_fd_ = server;
+          if (xTaskCreatePinnedToCore(&EspVideoCamera::rtsp_task_entry_, "camera_rtsp", 6144,
+                                      this, 1, &this->rtsp_task_handle_, 0) == pdPASS) {
+            rtsp_ok = true;
+          } else {
+            ESP_LOGW(TAG, "H.264: RTSP task creation failed; RTSP disabled");
+          }
+        }
+      }
+    }
+    if (rtsp_ok) {
+      this->h264_ready_.store(true);
       ESP_LOGCONFIG(TAG, "H.264 RTSP listening on :8554 (%ux%u @ %u fps, lazy encoder)",
                     this->h264_geom_.out_w, this->h264_geom_.out_h, (unsigned) H264_FPS);
     } else {
-      ESP_LOGW(TAG, "H.264: RTSP task/mutex setup failed; RTSP disabled");
+      if (this->rtsp_server_fd_ >= 0) {
+        close(this->rtsp_server_fd_);
+        this->rtsp_server_fd_ = -1;
+      }
+      if (this->rtsp_send_mutex_ != nullptr) {
+        vSemaphoreDelete(this->rtsp_send_mutex_);
+        this->rtsp_send_mutex_ = nullptr;
+      }
+      this->h264_ready_.store(false);
     }
   }
+#endif
   ESP_LOGCONFIG(TAG, "esp_video_camera ready: capture %ux%u -> rotate %u -> "
                      "RGB888 %ux%u (stream %ux%u)",
                 this->cap_w_, this->cap_h_, this->rotation_, this->out_w_,
@@ -606,6 +647,21 @@ bool EspVideoCamera::open_h264_() {
     return false;
   }
 
+  static constexpr size_t H264_MIN_PRE_NEW_INTERNAL_FREE = 96 * 1024;
+  static constexpr size_t H264_MIN_PRE_NEW_INTERNAL_BLOCK = 64 * 1024;
+  static constexpr size_t H264_MIN_PRE_OPEN_INTERNAL_FREE = 16 * 1024;
+  static constexpr size_t H264_MIN_PRE_OPEN_INTERNAL_BLOCK = 4 * 1024;
+
+  const size_t pre_new_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  const size_t pre_new_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  if (pre_new_free < H264_MIN_PRE_NEW_INTERNAL_FREE ||
+      pre_new_largest < H264_MIN_PRE_NEW_INTERNAL_BLOCK) {
+    ESP_LOGW(TAG, "H.264: low internal SRAM before enc_hw_new (free %u, largest %u)",
+             (unsigned) pre_new_free, (unsigned) pre_new_largest);
+    this->teardown_h264_();
+    return false;
+  }
+
   esp_h264_enc_cfg_hw_t cfg = {};
   cfg.pic_type = ESP_H264_RAW_FMT_O_UYY_E_VYY;
   cfg.gop = H264_GOP;
@@ -622,6 +678,19 @@ bool EspVideoCamera::open_h264_() {
     ESP_LOGW(TAG, "H.264: esp_h264_enc_hw_new failed (%d, internal free %u, psram free %u)",
              static_cast<int>(err), (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    this->teardown_h264_();
+    return false;
+  }
+  // esp_h264 1.3.0 enc_open() omits a NULL check on its internal frame_done
+  // semaphore (esp_h264_mutex_create()). Require internal SRAM headroom first
+  // so enc_open() cannot dereference a NULL semaphore under memory pressure.
+  const size_t pre_open_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  const size_t pre_open_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  if (pre_open_free < H264_MIN_PRE_OPEN_INTERNAL_FREE ||
+      pre_open_largest < H264_MIN_PRE_OPEN_INTERNAL_BLOCK) {
+    ESP_LOGW(TAG, "H.264: low internal SRAM before enc_open (free %u, largest %u)",
+             (unsigned) pre_open_free, (unsigned) pre_open_largest);
+    esp_h264_enc_del(enc);
     this->teardown_h264_();
     return false;
   }
@@ -1095,7 +1164,7 @@ void EspVideoCamera::capture_task_() {
     // Lazy H.264 encoder lifecycle (sole owner = capture_task_): open on PLAY
     // so frame 0 is guaranteed to be an IDR with SPS+PPS, and close immediately
     // when idle or when a new RTSP session preempts the old one.
-    if (this->h264_ready_) {
+    if (this->h264_ready_.load()) {
       const bool want_h264 = this->rtsp_playing_.load();
       const uint32_t cur_gen = this->rtsp_session_gen_.load();
       if (!want_h264) {
@@ -1298,7 +1367,11 @@ bool EspVideoCamera::encode_h264_(uint32_t capture_epoch, uint32_t session_gen,
   if (this->rtsp_play_start_us_ == 0)
     this->rtsp_play_start_us_ = frame_us;
   const uint32_t rtp_ts = rtp_timestamp_90khz(frame_us - this->rtsp_play_start_us_);
-  this->send_h264_rtp_(this->h264_output_, out_frame.length, rtp_ts, capture_epoch, session_gen);
+  if (!this->send_h264_rtp_(this->h264_output_, out_frame.length, rtp_ts, capture_epoch,
+                            session_gen)) {
+    return false;
+  }
+  this->rtsp_last_media_us_.store(esp_timer_get_time());
   return true;
 #else
   (void) capture_epoch;
@@ -1309,9 +1382,28 @@ bool EspVideoCamera::encode_h264_(uint32_t capture_epoch, uint32_t session_gen,
 }
 
 bool EspVideoCamera::send_rtsp_(int fd, const char *data, size_t len) {
-  if (this->rtsp_send_mutex_ == nullptr ||
-      xSemaphoreTake(this->rtsp_send_mutex_, pdMS_TO_TICKS(1600)) != pdTRUE) {
+  if (this->rtsp_send_mutex_ == nullptr)
     return false;
+  const int64_t deadline_us = esp_timer_get_time() + RTSP_CTRL_SEND_DEADLINE_US;
+  for (;;) {
+    const int64_t rem_us = deadline_us - esp_timer_get_time();
+    if (rem_us <= 0)
+      return false;
+    TickType_t wait_ticks = pdMS_TO_TICKS(static_cast<uint32_t>((rem_us + 999) / 1000));
+    if (wait_ticks == 0)
+      wait_ticks = 1;
+    if (xSemaphoreTake(this->rtsp_send_mutex_, wait_ticks) != pdTRUE)
+      return false;
+    const uint32_t cur_gen = this->rtsp_session_gen_.load();
+    if (!this->rtsp_partial_active_ || this->rtsp_partial_session_ != cur_gen)
+      break;
+    // Wait for an in-flight partial interleaved RTP packet to finish before
+    // writing an RTSP control response onto the shared TCP stream.
+    const bool still_playing = this->rtsp_playing_.load();
+    xSemaphoreGive(this->rtsp_send_mutex_);
+    if (!still_playing)
+      return false;
+    vTaskDelay(1);
   }
   size_t sent = 0;
   while (sent < len) {
@@ -1328,11 +1420,11 @@ bool EspVideoCamera::send_rtsp_(int fd, const char *data, size_t len) {
   return true;
 }
 
-void EspVideoCamera::send_h264_rtp_(const uint8_t *data, size_t len, uint32_t rtp_timestamp,
+bool EspVideoCamera::send_h264_rtp_(const uint8_t *data, size_t len, uint32_t rtp_timestamp,
                                     uint32_t capture_epoch, uint32_t session_gen) {
   if (this->sock_mutex_ == nullptr || this->rtsp_send_mutex_ == nullptr ||
       this->rtp_packet_buf_ == nullptr) {
-    return;
+    return false;
   }
   int fd = -1;
   xSemaphoreTake(this->sock_mutex_, portMAX_DELAY);
@@ -1341,40 +1433,79 @@ void EspVideoCamera::send_h264_rtp_(const uint8_t *data, size_t len, uint32_t rt
   xSemaphoreGive(this->sock_mutex_);
   if (fd < 0 || !this->rtsp_playing_.load() || !this->streaming_.load() ||
       this->stop_epoch_.load() != capture_epoch) {
-    return;
+    return false;
   }
+
+  // Single 100 ms total budget for all RTP packets of this access unit so a
+  // stalled TCP peer can never stall capture_task_().
+  const int64_t deadline_us = esp_timer_get_time() + H264_RTP_FRAME_BUDGET_US;
 
   auto session_live = [&]() {
     return this->rtsp_session_gen_.load() == session_gen &&
            this->rtsp_client_fd_.load() == fd && this->rtsp_playing_.load() &&
            this->streaming_.load() && this->stop_epoch_.load() == capture_epoch;
   };
+  auto take_send_mutex = [&]() -> bool {
+    const int64_t rem_us = deadline_us - esp_timer_get_time();
+    if (rem_us <= 0)
+      return false;
+    TickType_t wait_ticks = pdMS_TO_TICKS(static_cast<uint32_t>((rem_us + 999) / 1000));
+    if (wait_ticks == 0)
+      wait_ticks = 1;
+    return xSemaphoreTake(this->rtsp_send_mutex_, wait_ticks) == pdTRUE;
+  };
 
+  size_t packets_sent = 0;
   const bool ok = packetize_h264_annex_b_interleaved(
       data, len, rtp_timestamp, this->rtp_sequence_, H264_RTP_MAX_PAYLOAD, 0,
       this->rtp_packet_buf_, H264_RTP_SCRATCH_ALLOC_SIZE,
       [&](const uint8_t *framed, size_t framed_len, bool) -> bool {
-        if (!session_live())
+        if (!session_live() || !take_send_mutex())
           return false;
-        if (xSemaphoreTake(this->rtsp_send_mutex_, pdMS_TO_TICKS(500)) != pdTRUE)
-          return false;
-        size_t sent = 0;
+        bool mutex_held = true;
         bool packet_ok = true;
+        size_t sent = 0;
         while (sent < framed_len) {
           if (!session_live()) {
             packet_ok = false;
             break;
           }
-          const int n = send(fd, framed + sent, framed_len - sent, 0);
+          const int n = send(fd, framed + sent, framed_len - sent, MSG_DONTWAIT);
+          if (n > 0) {
+            sent += static_cast<size_t>(n);
+            continue;
+          }
           if (n < 0 && errno == EINTR)
             continue;
-          if (n <= 0) {
-            packet_ok = false;
-            break;
+          if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (esp_timer_get_time() >= deadline_us || !session_live()) {
+              packet_ok = false;
+              break;
+            }
+            if (sent > 0) {
+              this->rtsp_partial_active_ = true;
+              this->rtsp_partial_session_ = session_gen;
+            }
+            xSemaphoreGive(this->rtsp_send_mutex_);
+            mutex_held = false;
+            vTaskDelay(1);
+            if (!session_live() || esp_timer_get_time() >= deadline_us || !take_send_mutex()) {
+              packet_ok = false;
+              break;
+            }
+            mutex_held = true;
+            continue;
           }
-          sent += static_cast<size_t>(n);
+          packet_ok = false;
+          break;
         }
-        xSemaphoreGive(this->rtsp_send_mutex_);
+        if (mutex_held) {
+          if (this->rtsp_partial_active_ && this->rtsp_partial_session_ == session_gen)
+            this->rtsp_partial_active_ = false;
+          xSemaphoreGive(this->rtsp_send_mutex_);
+        }
+        if (packet_ok)
+          ++packets_sent;
         return packet_ok;
       });
   if (!ok) {
@@ -1384,7 +1515,9 @@ void EspVideoCamera::send_h264_rtp_(const uint8_t *data, size_t len, uint32_t rt
       shutdown(fd, SHUT_RDWR);
     }
     xSemaphoreGive(this->sock_mutex_);
+    return false;
   }
+  return packets_sent > 0;
 }
 
 void EspVideoCamera::rtsp_task_entry_(void *arg) {
@@ -1392,23 +1525,8 @@ void EspVideoCamera::rtsp_task_entry_(void *arg) {
 }
 
 void EspVideoCamera::rtsp_task_() {
-  int server = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+  const int server = this->rtsp_server_fd_;
   if (server < 0) {
-    ESP_LOGW(TAG, "RTSP socket failed: %s", strerror(errno));
-    this->rtsp_task_handle_ = nullptr;
-    vTaskDelete(nullptr);
-    return;
-  }
-  int one = 1;
-  setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-  sockaddr_in address = {};
-  address.sin_family = AF_INET;
-  address.sin_port = htons(8554);
-  address.sin_addr.s_addr = htonl(INADDR_ANY);
-  if (bind(server, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
-      listen(server, 2) != 0) {
-    ESP_LOGW(TAG, "RTSP bind/listen failed: %s", strerror(errno));
-    close(server);
     this->rtsp_task_handle_ = nullptr;
     vTaskDelete(nullptr);
     return;
@@ -1416,6 +1534,7 @@ void EspVideoCamera::rtsp_task_() {
 
   int client = -1;
   bool setup = false;
+  bool client_authed = false;
   std::string pending;
   int64_t last_rx_us = 0;
 
@@ -1425,6 +1544,7 @@ void EspVideoCamera::rtsp_task_() {
     const int fd = client;
     client = -1;
     setup = false;
+    client_authed = false;
     pending.clear();
     this->rtsp_playing_.store(false);
     xSemaphoreTake(this->sock_mutex_, portMAX_DELAY);
@@ -1436,6 +1556,7 @@ void EspVideoCamera::rtsp_task_() {
     // Wait for any in-flight send_h264_rtp_ packet on this fd before close().
     if (this->rtsp_send_mutex_ != nullptr) {
       xSemaphoreTake(this->rtsp_send_mutex_, portMAX_DELAY);
+      this->rtsp_partial_active_ = false;
       xSemaphoreGive(this->rtsp_send_mutex_);
     }
     close(fd);
@@ -1460,46 +1581,61 @@ void EspVideoCamera::rtsp_task_() {
       continue;
     }
 
-    // A new incoming connection preempts any existing (possibly zombie) client.
+    // Never allow an unauthenticated accept() to evict an authenticated or
+    // actively playing viewer; only an empty slot or idle unauthenticated
+    // connection may be replaced.
+    bool accepted_new = false;
     if (ready > 0 && FD_ISSET(server, &rfds)) {
       int next_client = accept(server, nullptr, nullptr);
       if (next_client >= 0) {
-        if (client >= 0) {
-          ESP_LOGI(TAG, "RTSP: preempting previous client for new connection");
-          close_client();
+        if (!rtsp_should_accept_replacement(client >= 0, this->rtsp_playing_.load(),
+                                            client_authed)) {
+          ESP_LOGD(TAG, "RTSP: rejecting connection while authenticated viewer is active");
+          close(next_client);
+        } else {
+          if (client >= 0) {
+            ESP_LOGI(TAG, "RTSP: preempting idle unauthenticated client");
+            close_client();
+          }
+          int nodelay = 1;
+          setsockopt(next_client, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+          timeval rcv_tv = {.tv_sec = 1, .tv_usec = 0};
+          timeval snd_tv = {.tv_sec = 0, .tv_usec = static_cast<suseconds_t>(RTSP_CTRL_SNDTIMEO_US)};
+          setsockopt(next_client, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
+          setsockopt(next_client, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
+          xSemaphoreTake(this->sock_mutex_, portMAX_DELAY);
+          this->rtsp_session_gen_.fetch_add(1);
+          this->rtsp_client_fd_.store(next_client);
+          xSemaphoreGive(this->sock_mutex_);
+          this->rtsp_playing_.store(false);
+          client = next_client;
+          setup = false;
+          client_authed = false;
+          pending.clear();
+          last_rx_us = esp_timer_get_time();
+          accepted_new = true;
         }
-        int nodelay = 1;
-        setsockopt(next_client, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-        timeval rcv_tv = {.tv_sec = 1, .tv_usec = 0};
-        timeval snd_tv = {.tv_sec = 1, .tv_usec = 500000};
-        setsockopt(next_client, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
-        setsockopt(next_client, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
-        xSemaphoreTake(this->sock_mutex_, portMAX_DELAY);
-        this->rtsp_session_gen_.fetch_add(1);
-        this->rtsp_client_fd_.store(next_client);
-        xSemaphoreGive(this->sock_mutex_);
-        this->rtsp_playing_.store(false);
-        client = next_client;
-        setup = false;
-        pending.clear();
-        last_rx_us = esp_timer_get_time();
       }
-      continue;
     }
+    if (accepted_new)
+      continue;
 
     if (client < 0)
       continue;
 
-    if (ready == 0) {
-      if (!this->rtsp_playing_.load() &&
-          esp_timer_get_time() - last_rx_us >= RTSP_IDLE_TIMEOUT_US) {
+    const bool playing = this->rtsp_playing_.load();
+    if (rtsp_session_timed_out(playing, esp_timer_get_time(), last_rx_us,
+                               this->rtsp_last_media_us_.load())) {
+      if (playing) {
+        ESP_LOGW(TAG, "RTSP: disconnecting stalled playback session (no media for >5 s)");
+      } else {
         ESP_LOGD(TAG, "RTSP: disconnecting idle client");
-        close_client();
       }
+      close_client();
       continue;
     }
 
-    if (!FD_ISSET(client, &rfds))
+    if (ready == 0 || !FD_ISSET(client, &rfds))
       continue;
 
     char chunk[512];
@@ -1544,67 +1680,71 @@ void EspVideoCamera::rtsp_task_() {
       bool play_after_response = false;
       uint32_t play_epoch = 0;
 
-      if (!constant_time_equals(auth, this->h264_auth_)) {
+      if (this->h264_auth_.empty() || !constant_time_equals(auth, this->h264_auth_)) {
         snprintf(response, sizeof(response),
                  "RTSP/1.0 401 Unauthorized\r\nCSeq: %s\r\n"
                  "WWW-Authenticate: Basic realm=\"ESP32-P4 Camera\"\r\n\r\n",
                  cseq.c_str());
-      } else if (request.rfind("OPTIONS ", 0) == 0) {
-        snprintf(response, sizeof(response),
-                 "RTSP/1.0 200 OK\r\nCSeq: %s\r\n"
-                 "Public: OPTIONS, DESCRIBE, SETUP, PLAY, GET_PARAMETER, TEARDOWN\r\n\r\n",
-                 cseq.c_str());
-      } else if (request.rfind("DESCRIBE ", 0) == 0) {
-        H264SpropParams sprop{};
-        xSemaphoreTake(this->sock_mutex_, portMAX_DELAY);
-        sprop = this->h264_sprop_;
-        xSemaphoreGive(this->sock_mutex_);
-        const std::string sdp = format_rtsp_sdp(this->h264_geom_.out_w, this->h264_geom_.out_h,
-                                                H264_FPS, sprop.valid() ? &sprop : nullptr);
-        const int head = snprintf(response, sizeof(response),
-                                  "RTSP/1.0 200 OK\r\nCSeq: %s\r\nContent-Type: application/sdp\r\n"
-                                  "Content-Length: %u\r\n\r\n%s",
-                                  cseq.c_str(), static_cast<unsigned>(sdp.size()), sdp.c_str());
-        if (head < 0 || static_cast<size_t>(head) >= sizeof(response)) {
+      } else {
+        client_authed = true;
+        if (request.rfind("OPTIONS ", 0) == 0) {
+          snprintf(response, sizeof(response),
+                   "RTSP/1.0 200 OK\r\nCSeq: %s\r\n"
+                   "Public: OPTIONS, DESCRIBE, SETUP, PLAY, GET_PARAMETER, TEARDOWN\r\n\r\n",
+                   cseq.c_str());
+        } else if (request.rfind("DESCRIBE ", 0) == 0) {
+          H264SpropParams sprop{};
+          xSemaphoreTake(this->sock_mutex_, portMAX_DELAY);
+          sprop = this->h264_sprop_;
+          xSemaphoreGive(this->sock_mutex_);
+          const std::string sdp = format_rtsp_sdp(this->h264_geom_.out_w, this->h264_geom_.out_h,
+                                                  H264_FPS, sprop.valid() ? &sprop : nullptr);
+          const int head = snprintf(response, sizeof(response),
+                                    "RTSP/1.0 200 OK\r\nCSeq: %s\r\nContent-Type: application/sdp\r\n"
+                                    "Content-Length: %u\r\n\r\n%s",
+                                    cseq.c_str(), static_cast<unsigned>(sdp.size()), sdp.c_str());
+          if (head < 0 || static_cast<size_t>(head) >= sizeof(response)) {
+            disconnect_client = true;
+            break;
+          }
+        } else if (request.rfind("SETUP ", 0) == 0) {
+          const std::string transport = rtsp_header(request, "Transport");
+          if (transport.find("RTP/AVP/TCP") == std::string::npos) {
+            snprintf(response, sizeof(response),
+                     "RTSP/1.0 461 Unsupported Transport\r\nCSeq: %s\r\n\r\n", cseq.c_str());
+          } else {
+            setup = true;
+            snprintf(response, sizeof(response),
+                     "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: 1\r\n"
+                     "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n",
+                     cseq.c_str());
+          }
+        } else if (request.rfind("PLAY ", 0) == 0 && setup) {
+          play_epoch = this->stop_epoch_.load();
+          if (!this->stream_requested_.load() || !this->streaming_.load()) {
+            snprintf(response, sizeof(response),
+                     "RTSP/1.0 503 Service Unavailable\r\nCSeq: %s\r\n\r\n", cseq.c_str());
+          } else {
+            play_after_response = true;
+            snprintf(response, sizeof(response),
+                     "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: 1\r\n"
+                     "RTP-Info: url=trackID=0;seq=0;rtptime=0\r\n\r\n",
+                     cseq.c_str());
+          }
+        } else if (request.rfind("GET_PARAMETER ", 0) == 0) {
+          snprintf(response, sizeof(response),
+                   "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: 1\r\n\r\n", cseq.c_str());
+        } else if (request.rfind("TEARDOWN ", 0) == 0) {
+          this->rtsp_playing_.store(false);
+          snprintf(response, sizeof(response),
+                   "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: 1\r\n\r\n", cseq.c_str());
+          this->send_rtsp_(client, response, strlen(response));
           disconnect_client = true;
           break;
-        }
-      } else if (request.rfind("SETUP ", 0) == 0) {
-        const std::string transport = rtsp_header(request, "Transport");
-        if (transport.find("RTP/AVP/TCP") == std::string::npos) {
-          snprintf(response, sizeof(response),
-                   "RTSP/1.0 461 Unsupported Transport\r\nCSeq: %s\r\n\r\n", cseq.c_str());
         } else {
-          setup = true;
           snprintf(response, sizeof(response),
-                   "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: 1\r\n"
-                   "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n",
-                   cseq.c_str());
+                   "RTSP/1.0 405 Method Not Allowed\r\nCSeq: %s\r\n\r\n", cseq.c_str());
         }
-      } else if (request.rfind("PLAY ", 0) == 0 && setup) {
-        play_epoch = this->stop_epoch_.load();
-        if (!this->stream_requested_.load() || !this->streaming_.load()) {
-          snprintf(response, sizeof(response),
-                   "RTSP/1.0 503 Service Unavailable\r\nCSeq: %s\r\n\r\n", cseq.c_str());
-        } else {
-          play_after_response = true;
-          snprintf(response, sizeof(response),
-                   "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: 1\r\n"
-                   "RTP-Info: url=trackID=0;seq=0;rtptime=0\r\n\r\n",
-                   cseq.c_str());
-        }
-      } else if (request.rfind("GET_PARAMETER ", 0) == 0) {
-        snprintf(response, sizeof(response),
-                 "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: 1\r\n\r\n", cseq.c_str());
-      } else if (request.rfind("TEARDOWN ", 0) == 0) {
-        snprintf(response, sizeof(response),
-                 "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: 1\r\n\r\n", cseq.c_str());
-        this->send_rtsp_(client, response, strlen(response));
-        disconnect_client = true;
-        break;
-      } else {
-        snprintf(response, sizeof(response),
-                 "RTSP/1.0 405 Method Not Allowed\r\nCSeq: %s\r\n\r\n", cseq.c_str());
       }
 
       if (!this->send_rtsp_(client, response, strlen(response))) {
@@ -1624,6 +1764,7 @@ void EspVideoCamera::rtsp_task_() {
           this->rtsp_session_gen_.fetch_add(1);
           xSemaphoreGive(this->sock_mutex_);
         }
+        this->rtsp_last_media_us_.store(esp_timer_get_time());
         this->rtsp_playing_.store(true);
         if (!this->stream_requested_.load() || !this->streaming_.load() ||
             this->stop_epoch_.load() != play_epoch) {
@@ -2129,7 +2270,7 @@ void EspVideoCamera::dump_config() {
                   (unsigned) this->task_frames_.load());
   if (this->h264_enabled_) {
     ESP_LOGCONFIG(TAG, "  H.264 RTSP: %s, %ux%u @ %u fps, %u kbps, port 8554, Basic auth (lazy)",
-                  this->h264_ready_ ? "ready" : "unavailable", this->h264_geom_.out_w,
+                  this->h264_ready_.load() ? "ready" : "unavailable", this->h264_geom_.out_w,
                   this->h264_geom_.out_h, (unsigned) H264_FPS, (unsigned) (H264_BITRATE / 1000u));
   }
   if (this->is_failed())

@@ -145,7 +145,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   static void rtsp_task_entry_(void *arg);
   bool encode_h264_(uint32_t capture_epoch, uint32_t session_gen, int64_t frame_us);
   bool send_rtsp_(int fd, const char *data, size_t len);
-  void send_h264_rtp_(const uint8_t *data, size_t len, uint32_t rtp_timestamp,
+  bool send_h264_rtp_(const uint8_t *data, size_t len, uint32_t rtp_timestamp,
                       uint32_t capture_epoch, uint32_t session_gen);
 
   bool ensure_jpeg_encoder_();
@@ -238,7 +238,8 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   // Camera task + lazy direct H.264/RTSP state.
   bool task_mode_{false};
   std::atomic<uint32_t> task_frames_{0};  // camera task owns V4L2 (any live stream enabled)
-  bool h264_ready_{false};                // RTSP listener started
+  std::atomic<bool> h264_ready_{false};   // RTSP listener bound & task started
+  int rtsp_server_fd_{-1};
   H264Geometry h264_geom_{};
   void *h264_enc_{nullptr};               // esp_h264_enc_handle_t; owned by capture_task_
   uint8_t *h264_yuv_{nullptr};            // lazy PSRAM O_UYY_E_VYY input buffer
@@ -252,11 +253,14 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   TaskHandle_t rtsp_task_handle_{nullptr};
   SemaphoreHandle_t frame_done_{nullptr};
   SemaphoreHandle_t rtsp_send_mutex_{nullptr};
+  bool rtsp_partial_active_{false};       // guarded by rtsp_send_mutex_
+  uint32_t rtsp_partial_session_{0};      // guarded by rtsp_send_mutex_
   std::atomic<bool> stream_requested_{false};
   FrameHandoff frame_handoff_{};
   std::atomic<bool> rtsp_playing_{false};
   std::atomic<int> rtsp_client_fd_{-1};
   std::atomic<uint32_t> rtsp_session_gen_{0};
+  std::atomic<int64_t> rtsp_last_media_us_{0};
   uint16_t rtp_sequence_{0};
   int64_t rtsp_play_start_us_{0};
   int64_t last_h264_us_{0};

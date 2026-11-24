@@ -18,6 +18,8 @@ static constexpr uint8_t H264_QP_MAX = 40;
 // 60 ms spacing hits every 2nd 30-fps CSI frame (~15 fps steady) without
 // jittering down to 10 fps when two CSI frames arrive 66.5 ms apart.
 static constexpr int64_t H264_MIN_FRAME_US = 60000;
+static constexpr int64_t RTSP_IDLE_TIMEOUT_US = 10000000;         // 10 s non-playing idle
+static constexpr int64_t RTSP_MEDIA_STALL_TIMEOUT_US = 5000000;   // 5 s playing media stall
 
 static constexpr size_t H264_RTP_MAX_PAYLOAD = 1400;
 static constexpr size_t H264_RTP_INTERLEAVED_HEADER = 4;
@@ -80,6 +82,26 @@ inline bool constant_time_equals(const std::string &a, const std::string &b) {
     diff = static_cast<uint8_t>(diff | static_cast<uint8_t>(ca ^ cb));
   }
   return diff == 0u;
+}
+
+// Never allow an unauthenticated accept() to evict an authenticated or actively
+// playing viewer; only an empty slot or an idle unauthenticated connection may
+// be replaced.
+inline bool rtsp_should_accept_replacement(bool has_client, bool client_playing,
+                                           bool client_authed) {
+  if (!has_client)
+    return true;
+  return !client_playing && !client_authed;
+}
+
+// RTSP session liveness policy:
+// - While playing: disconnect if >5 s elapsed without a delivered media frame.
+// - While not playing: disconnect if >=10 s elapsed without control traffic.
+inline bool rtsp_session_timed_out(bool playing, int64_t now_us, int64_t last_ctrl_us,
+                                   int64_t last_media_us) {
+  if (playing)
+    return now_us - last_media_us > RTSP_MEDIA_STALL_TIMEOUT_US;
+  return now_us - last_ctrl_us >= RTSP_IDLE_TIMEOUT_US;
 }
 
 inline std::string base64_encode(const uint8_t *data, size_t len) {
