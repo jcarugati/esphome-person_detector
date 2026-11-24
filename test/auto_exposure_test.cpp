@@ -11,9 +11,13 @@
 using esphome::esp_video_camera::AutoExposureConfig;
 using esphome::esp_video_camera::AutoExposureController;
 using esphome::esp_video_camera::AutoExposureDecision;
-using esphome::esp_video_camera::normalize_illuminance_pct;
+using esphome::esp_video_camera::ae_settling_frame_count;
+using esphome::esp_video_camera::default_ae_gain_ceiling;
+using esphome::esp_video_camera::pack_ae_feedback;
 using esphome::esp_video_camera::sc202cs_gain_factor;
 using esphome::esp_video_camera::sc202cs_gain_index_for_factor;
+using esphome::esp_video_camera::unpack_ae_feedback;
+using esphome::person_detect::normalize_illuminance_pct;
 
 static bool near(float a, float b, float tol = 1e-4f) {
   return std::fabs(a - b) <= tol;
@@ -79,9 +83,15 @@ int main() {
   // 2. Deadband holds steady (no spurious writes in [97..133]).
   AutoExposureController ae{};
   ae.configure(8, 1244, 0, 191);
+  // Freshly configured controller starts unknown until hardware writes succeed.
+  assert(!ae.is_known());
+  assert(std::isnan(ae.exposure_scale()));
+  assert(ae.should_retry_unknown(0));
+  ae.mark_applied(1244, 191, 0);
+  assert(ae.is_known());
   assert(ae.exposure() == 1244 && ae.gain() == 191);
   assert(ae.exposure_scale() == 1.0f);
-  int64_t t = 0;
+  int64_t t = 5 * kSec;
   for (int luma = 97; luma <= 133; ++luma) {
     const AutoExposureDecision d = ae.update(static_cast<uint8_t>(luma), t);
     assert(!d.changed && !d.exposure_changed && !d.gain_changed);
@@ -98,11 +108,13 @@ int main() {
 
   // 3. Settle-frame skip and >= 3000 ms rate limiting.
   ae.reset();
+  ae.mark_applied(1244, 191, 0);
   t = 10 * kSec;
   {
     const AutoExposureDecision d1 = ae.update(220, t);
     assert(d1.changed && d1.gain_changed && !d1.exposure_changed);
     assert(d1.exposure == 1244 && d1.gain < 191);
+    ae.mark_applied(d1.exposure, d1.gain, t);
 
     // Even 10 seconds later, the very first report after a write is skipped to
     // let the sensor pipeline settle.
@@ -112,13 +124,14 @@ int main() {
     // Next report succeeds because settle is done and >= 3s elapsed.
     const AutoExposureDecision d2 = ae.update(220, t + 11 * kSec);
     assert(d2.changed && d2.gain < d1.gain);
+    ae.mark_applied(d2.exposure, d2.gain, t + 11 * kSec);
 
     // Now test rapid reports: settle skipped at +1s, rate-limited at +2s and
     // +2.999s, then allowed at +3.0s.
     const int64_t t2 = t + 11 * kSec;
-    assert(!ae.update(220, t2 + 1 * kSec).changed);           // settle frame
-    assert(!ae.update(220, t2 + 2 * kSec).changed);           // < 3s
-    assert(!ae.update(220, t2 + 3 * kSec - 1).changed);       // 2999.999 ms
+    assert(!ae.update(220, t2 + 1 * kSec).changed);       // settle frame
+    assert(!ae.update(220, t2 + 2 * kSec).changed);       // < 3s
+    assert(!ae.update(220, t2 + 3 * kSec - 1).changed);   // 2999.999 ms
     const AutoExposureDecision d3 = ae.update(220, t2 + 3 * kSec);
     assert(d3.changed && d3.gain < d2.gain);
   }
@@ -127,7 +140,8 @@ int main() {
   //    exposure; converges into deadband [97..133] without oscillating.
   {
     ae.reset();
-    t = 0;
+    ae.mark_applied(1244, 191, 0);
+    t = 3 * kSec;
     const float bright_indoor = 1200.0f;  // ~10x brighter than target=115 at ceiling
     bool saw_exposure_change = false;
     int changes = 0;
@@ -136,6 +150,7 @@ int main() {
       last_luma = simulate_sensor_luma(bright_indoor, ae.exposure_scale());
       const AutoExposureDecision d = ae.update(last_luma, t);
       if (d.changed) {
+        ae.mark_applied(d.exposure, d.gain, t);
         ++changes;
         if (d.exposure_changed)
           saw_exposure_change = true;
@@ -157,7 +172,8 @@ int main() {
   // Direct sunlight: gain drops to 0 FIRST, then exposure drops below 1244.
   {
     ae.reset();
-    t = 0;
+    ae.mark_applied(1244, 191, 0);
+    t = 3 * kSec;
     const float direct_sun = 40000.0f;
     bool exposure_moved_before_min_gain = false;
     uint8_t last_luma = 255;
@@ -165,8 +181,11 @@ int main() {
       last_luma = simulate_sensor_luma(direct_sun, ae.exposure_scale());
       const int32_t prev_exp = ae.exposure();
       const AutoExposureDecision d = ae.update(last_luma, t);
-      if (d.changed && d.exposure < prev_exp && d.gain > ae.min_gain())
-        exposure_moved_before_min_gain = true;
+      if (d.changed) {
+        if (d.exposure < prev_exp && d.gain > ae.min_gain())
+          exposure_moved_before_min_gain = true;
+        ae.mark_applied(d.exposure, d.gain, t);
+      }
       t += 1500000;
     }
     assert(!exposure_moved_before_min_gain);
@@ -187,8 +206,11 @@ int main() {
       const uint8_t y = simulate_sensor_luma(dark_room, ae.exposure_scale());
       const int32_t prev_gain = ae.gain();
       const AutoExposureDecision d = ae.update(y, t);
-      if (d.changed && d.gain > prev_gain && d.exposure < ae.max_exposure())
-        gain_moved_before_max_exp = true;
+      if (d.changed) {
+        if (d.gain > prev_gain && d.exposure < ae.max_exposure())
+          gain_moved_before_max_exp = true;
+        ae.mark_applied(d.exposure, d.gain, t);
+      }
       t += 1500000;
     }
     assert(!gain_moved_before_max_exp);
@@ -201,9 +223,12 @@ int main() {
   // Extreme bright scene clamps at floor (min_exp, min_gain) and stops writing.
   {
     ae.reset();
-    t = 0;
+    ae.mark_applied(1244, 191, 0);
+    t = 3 * kSec;
     for (int step = 0; step < 120; ++step) {
-      ae.update(255, t);
+      const AutoExposureDecision d = ae.update(255, t);
+      if (d.changed)
+        ae.mark_applied(d.exposure, d.gain, t);
       t += 1500000;
     }
     assert(ae.exposure() == 8 && ae.gain() == 0);
@@ -217,7 +242,7 @@ int main() {
     float prev_scale = 0.0f;
     // Exposure sweep at min gain (8..1244, gain=0)
     for (int32_t exp = 8; exp <= 1244; ++exp) {
-      ae.sync_applied(exp, 0, false);
+      ae.mark_applied(exp, 0, 0);
       const float s = ae.exposure_scale();
       assert(std::isfinite(s) && s > prev_scale && s < 1.0f);
       prev_scale = s;
@@ -225,7 +250,7 @@ int main() {
     const float knee_scale = prev_scale;
     // Gain sweep at max exposure (exp=1244, gain=1..191)
     for (int32_t gain = 1; gain <= 191; ++gain) {
-      ae.sync_applied(1244, gain, false);
+      ae.mark_applied(1244, gain, 0);
       const float s = ae.exposure_scale();
       assert(std::isfinite(s) && s > prev_scale);
       if (gain == 1) {
@@ -237,15 +262,12 @@ int main() {
     assert(ae.exposure_scale() == 1.0f);
   }
 
-  // 7. normalize_illuminance_pct(): exact parity between esp_video_camera and
-  //    person_detect helpers, fixed-mode equivalence, daylight scaling, and
-  //    defensive fallback on invalid scales.
+  // 7. Single normalize_illuminance_pct() in person_detect/frame_source.h:
+  //    fixed-mode equivalence, daylight scaling, and defensive fallback.
   for (int y = 0; y <= 255; ++y) {
     const uint8_t luma = static_cast<uint8_t>(y);
     const float expected = static_cast<float>(luma) * 100.0f / 255.0f;
-    const float p1 = normalize_illuminance_pct(luma, 1.0f);
-    const float p2 = esphome::person_detect::normalize_illuminance_pct(luma, 1.0f);
-    assert(p1 == expected && p2 == expected);
+    assert(normalize_illuminance_pct(luma, 1.0f) == expected);
   }
   // Nocturne thresholds preserved at ceiling (scale=1.0):
   //   luma=63 -> 24.7% (< 25% DARK), luma=115 -> 45.1% (> 45% LIGHT)
@@ -268,55 +290,196 @@ int main() {
   for (float bad : invalid_scales) {
     const float expected = 115.0f * 100.0f / 255.0f;
     assert(near(normalize_illuminance_pct(115, bad), expected));
-    assert(near(esphome::person_detect::normalize_illuminance_pct(115, bad), expected));
   }
 
-  // 8. ioctl failure reconciliation via sync_applied().
+  // 8. Regression (Astra #2): pre-change queued buffer & settling frames are
+  //    NEVER stamped with the new exposure scale.
+  //    Model a 2-buffer V4L2 ring captured at 0.5x followed by a 1.0x command:
+  //    - Dequeued pre-change frame (before writing 1.0x) keeps 0.5x.
+  //    - Next fb_count + 3 = 5 settling frames report NaN (unknown).
+  //    - First settled post-change frame reports 1.0x.
   {
+    constexpr uint8_t kFbCount = 2;
+    const uint8_t task_settle = ae_settling_frame_count(kFbCount, true);
+    const uint8_t non_task_settle = ae_settling_frame_count(kFbCount, false);
+    assert(task_settle == kFbCount + 3);
+    assert(non_task_settle == 1);
+
+    ae.configure(8, 1244, 0, 0);
+    ae.mark_applied(622, 0, 0, 0);  // Settled at exact 0.5x
+    assert(near(ae.exposure_scale(), 0.5f));
+
+    // Dequeue & stamp an already-queued frame BEFORE applying the 1.0x write.
+    const float pre_change_stamp = ae.stamp_dequeued_frame();
+    assert(near(pre_change_stamp, 0.5f));
+
+    // Now apply the 1.0x command after stamping the pre-change frame
+    // (luma=20 -> raw_ratio=5.75 -> clamped to +1 EV = 2.0x -> 622 -> 1244).
+    const AutoExposureDecision step = ae.update(20, 5 * kSec);
+    assert(step.changed && step.exposure_changed && step.exposure == 1244);
+    ae.mark_applied(step.exposure, step.gain, 5 * kSec, task_settle);
+    assert(ae.is_settling() && ae.settling_frames() == 5);
+
+    // Every queued V4L2 buffer + 3 SC202CS pipeline delay frames gets NaN.
+    for (uint8_t i = 0; i < task_settle; ++i) {
+      assert(!ae.update(250, 10 * kSec + i * kSec).changed);  // AE ignores feedback while settling
+      const float settling_stamp = ae.stamp_dequeued_frame();
+      assert(std::isnan(settling_stamp));
+    }
+    assert(!ae.is_settling());
+
+    // First settled post-change frame carries the new 1.0x scale.
+    const float post_change_stamp = ae.stamp_dequeued_frame();
+    assert(post_change_stamp == 1.0f);
+
+    // Non-task mode marks exactly 1 settling frame after a change.
+    ae.mark_applied(622, 0, 20 * kSec, non_task_settle);
+    assert(std::isnan(ae.stamp_dequeued_frame()));
+    assert(near(ae.stamp_dequeued_frame(), 0.5f));
+  }
+
+  // 9. Regression (Astra #3): startup ioctl failure and partial mid-stream
+  //    ioctl failure leave physical registers unknown (NaN scale) until a
+  //    rate-limited complete (exposure + gain) retry succeeds and settles.
+  {
+    constexpr uint8_t kSettle = 5;  // fb_count=2 + 3
     ae.configure(8, 1244, 0, 191);
+
+    // Startup failure: first attempt at t=0 fails -> remains unknown.
+    assert(!ae.is_known() && ae.should_retry_unknown(0));
+    ae.mark_unknown(0);
+    assert(!ae.is_known());
+    assert(std::isnan(ae.exposure_scale()));
+    assert(std::isnan(ae.stamp_dequeued_frame()));
+    assert(!ae.update(240, 1 * kSec).changed);
+    assert(!ae.should_retry_unknown(2 * kSec));
+    assert(!ae.should_retry_unknown(3 * kSec - 1));
+
+    // At >= 3s, complete retry succeeds -> known + settling -> settled 1.0f.
+    assert(ae.should_retry_unknown(3 * kSec));
+    assert(ae.exposure() == 1244 && ae.gain() == 191);
+    ae.mark_applied(ae.exposure(), ae.gain(), 3 * kSec, kSettle);
+    assert(ae.is_known() && !ae.should_retry_unknown(10 * kSec));
+    for (uint8_t i = 0; i < kSettle; ++i)
+      assert(std::isnan(ae.stamp_dequeued_frame()));
+    assert(ae.stamp_dequeued_frame() == 1.0f);
+
+    // Mid-stream partial ioctl failure: AE steps down at t=10s, one ioctl fails
+    // -> mark_unknown(10s) -> NEVER assumes previous scale still holds!
     const AutoExposureDecision d = ae.update(240, 10 * kSec);
     assert(d.changed && d.gain < 191);
-    // Total ioctl failure: revert to (1244, 191), clear settle, keep 3s rate limit.
-    ae.sync_applied(1244, 191, false);
-    assert(ae.exposure() == 1244 && ae.gain() == 191 && ae.exposure_scale() == 1.0f);
-    assert(!ae.update(240, 11 * kSec).changed);  // still rate-limited (< 3s)
-    const AutoExposureDecision retry = ae.update(240, 13 * kSec);
-    assert(retry.changed && retry.gain < 191);   // no extra settle skip after total fail
+    const int32_t target_exp = d.exposure;
+    const int32_t target_gain = d.gain;
+    ae.mark_unknown(10 * kSec);
+    assert(!ae.is_known());
+    assert(std::isnan(ae.exposure_scale()));
+    assert(std::isnan(ae.stamp_dequeued_frame()));
+    assert(!ae.update(240, 15 * kSec).changed);  // cannot step while unknown
+    assert(!ae.should_retry_unknown(12 * kSec));
+
+    // At 13s (>= 3s after failure), complete retry of BOTH target_exp and
+    // target_gain succeeds -> known + settling -> settled new scale.
+    assert(ae.should_retry_unknown(13 * kSec));
+    assert(ae.exposure() == target_exp && ae.gain() == target_gain);
+    ae.mark_applied(ae.exposure(), ae.gain(), 13 * kSec, kSettle);
+    assert(ae.is_known());
+    for (uint8_t i = 0; i < kSettle; ++i)
+      assert(std::isnan(ae.stamp_dequeued_frame()));
+    const float recovered_scale = ae.stamp_dequeued_frame();
+    assert(std::isfinite(recovered_scale) && recovered_scale > 0.0f && recovered_scale < 1.0f);
   }
 
-  // 9. Privacy reset() restores ceiling and clears settle & rate-limit timers.
+  // 10. Regression (Astra #4): epoch-tagged atomic feedback packing & stale
+  //     session rejection across privacy OFF/ON restarts.
+  {
+    uint8_t luma = 99;
+    uint32_t epoch = 99;
+    assert(!unpack_ae_feedback(0, luma, epoch));
+
+    const uint64_t p0 = pack_ae_feedback(0, 0);
+    assert(p0 != 0);
+    assert(unpack_ae_feedback(p0, luma, epoch));
+    assert(luma == 0 && epoch == 0);
+
+    const uint64_t p1 = pack_ae_feedback(215, 7);
+    assert(unpack_ae_feedback(p1, luma, epoch));
+    assert(luma == 215 && epoch == 7);
+    // Simulate camera restarted at epoch 8: stale epoch 7 feedback is rejected.
+    const uint32_t current_epoch = 8;
+    assert(epoch != current_epoch);
+
+    const uint64_t pmax = pack_ae_feedback(255, 0xFFFFFFFFu);
+    assert(unpack_ae_feedback(pmax, luma, epoch));
+    assert(luma == 255 && epoch == 0xFFFFFFFFu);
+  }
+
+  // 11. Regression (Astra #5 + Opus #1): omitted-gain default ceiling keeps
+  //     fixed-mode parity (63, clamped to sensor bounds) across both Nocturne
+  //     thresholds (25% DARK / 45% LIGHT).
+  {
+    assert(default_ae_gain_ceiling(0, 191) == 63);
+    assert(default_ae_gain_ceiling(0, 40) == 40);
+    assert(default_ae_gain_ceiling(80, 191) == 80);
+
+    // Default ceiling (exposure=811, gain=63) matches fixed mode exactly.
+    ae.configure(8, 811, 0, default_ae_gain_ceiling(0, 191));
+    ae.mark_applied(811, 63, 0);
+    assert(ae.max_gain() == 63 && ae.gain() == 63);
+    assert(ae.exposure_scale() == 1.0f);
+    // Dark bedroom (< 25% Nocturne DARK threshold): stays at ceiling 1.0x.
+    assert(normalize_illuminance_pct(60, ae.exposure_scale()) < 25.0f);
+    assert(!ae.update(60, 5 * kSec).changed);
+    // Bright bedroom (> 45% Nocturne LIGHT threshold): at ceiling luma=115 -> 45.1%.
+    assert(normalize_illuminance_pct(115, ae.exposure_scale()) > 45.0f);
+    // Daylight scene: AE steps down below gain=63 while normalized light stays > 45%.
+    const AutoExposureDecision day = ae.update(230, 5 * kSec);
+    assert(day.changed && day.gain < 63);
+    ae.mark_applied(day.exposure, day.gain, 5 * kSec);
+    const float day_scale = ae.exposure_scale();
+    assert(day_scale > 0.0f && day_scale < 1.0f);
+    assert(normalize_illuminance_pct(115, day_scale) > 45.0f);
+  }
+
+  // 12. Privacy reset() restores ceiling, marks unknown, and clears timers.
   {
     ae.configure(8, 1244, 0, 191);
+    ae.mark_applied(1244, 191, 0);
     const AutoExposureDecision d = ae.update(250, 50 * kSec);
     assert(d.changed && ae.exposure_scale() < 1.0f);
     ae.reset();
+    assert(!ae.is_known() && ae.should_retry_unknown(1 * kSec));
     assert(ae.exposure() == 1244 && ae.gain() == 191);
+    assert(std::isnan(ae.exposure_scale()));
+    ae.mark_applied(1244, 191, 1 * kSec);
     assert(ae.exposure_scale() == 1.0f);
-    // Immediately responsive even at a smaller timestamp (no settle or rate holdover).
-    const AutoExposureDecision after = ae.update(250, 1 * kSec);
+    // Responsive once min_interval_us elapses after the post-reset write.
+    const AutoExposureDecision after = ae.update(250, 4 * kSec);
     assert(after.changed && after.gain < 191);
   }
 
-  // 10. Edge cases: min == max, luma == 0, luma == 255, non-monotonic clock.
+  // 13. Edge cases: min == max, luma == 0, luma == 255, non-monotonic clock.
   {
     // Locked min == max
     ae.configure(500, 500, 32, 32);
+    ae.mark_applied(500, 32, 0);
     assert(ae.exposure_scale() == 1.0f);
-    assert(!ae.update(0, 0).changed);
+    assert(!ae.update(0, 5 * kSec).changed);
     assert(!ae.update(255, 10 * kSec).changed);
     assert(ae.exposure() == 500 && ae.gain() == 32 && ae.exposure_scale() == 1.0f);
 
     // Inverted / zero bounds sanitized safely
     ae.configure(0, 0, -5, -1);
+    ae.mark_applied(1, 0, 0);
     assert(ae.min_exposure() == 1 && ae.max_exposure() == 1);
     assert(ae.min_gain() == 0 && ae.max_gain() == 0);
     assert(ae.exposure_scale() == 1.0f);
 
     // luma == 0 recovers smoothly from low exposure without div-by-zero
     ae.configure(8, 1244, 0, 191);
-    ae.sync_applied(20, 0, false);
+    ae.mark_applied(20, 0, 0);
     const AutoExposureDecision d0 = ae.update(0, 10 * kSec);
     assert(d0.changed && d0.exposure == 40 && d0.gain == 0);
+    ae.mark_applied(d0.exposure, d0.gain, 10 * kSec);
 
     // Clock wrap / backwards timestamp: re-anchors without spurious write, then resumes.
     assert(!ae.update(0, 11 * kSec).changed);           // settle skip

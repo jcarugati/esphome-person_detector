@@ -62,7 +62,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   void stop() override;
   bool acquire(person_detect::FrameView &out, uint32_t timeout_ms) override;
   void release() override;
-  void report_luma(uint8_t mean_luma) override;
+  void report_luma(uint8_t mean_luma, uint32_t capture_epoch) override;
 
   // Codegen setters
   void set_sccb_pins(int sda, int scl) {
@@ -132,9 +132,10 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   // doesn't take (and some ISP paths drift exposure), so acquire() calls this
   // periodically so a missed/drifted value self-corrects. Silent.
   bool reassert_controls_();
-  // Consume any luma sample reported by person_detect and step closed-loop AE
-  // on the V4L2-owning thread (never called from person_detect).
-  void step_auto_exposure_();
+  // Consume any luma sample reported by person_detect (or retry unknown sensor
+  // controls after an ioctl failure) on the V4L2-owning thread after the
+  // current frame has been dequeued and stamped.
+  void step_auto_exposure_(uint32_t current_epoch);
 
   // Optional H.264/RTSP and MJPEG paths. A dedicated camera task is the sole
   // V4L2 reader whenever a live stream is enabled, and lazily owns the direct
@@ -210,9 +211,11 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   int applied_gain_val_{-1};
   int64_t last_ctrl_us_{0};
   AutoExposureController ae_{};
-  std::atomic<int32_t> pending_ae_luma_{-1};
-  bool ae_reassert_pending_{false};
+  std::atomic<uint64_t> pending_ae_feedback_{0};
+  // Written ONLY alongside rotated_ inside the frame handoff (before deliver()
+  // in task mode, or under v4l2_mutex_ in non-task mode).
   float rotated_exposure_scale_{1.0f};
+  uint32_t rotated_capture_epoch_{0};
 
   // Runtime
   bool ready_{false};

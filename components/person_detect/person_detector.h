@@ -34,11 +34,12 @@ enum class Model : uint8_t {
 
 // Result produced by one inference, handed from the task to the main loop.
 struct InferenceResult {
-  bool person_raw{false};   // best-box score >= threshold
-  float best_score{0.0f};   // 0..1
-  uint8_t count{0};         // boxes >= threshold
-  uint32_t infer_ms{0};     // inference wall time
-  float illuminance{0.0f};  // whole-frame brightness, 0..100%
+  bool person_raw{false};       // best-box score >= threshold
+  float best_score{0.0f};       // 0..1
+  uint8_t count{0};             // boxes >= threshold
+  uint32_t infer_ms{0};         // inference wall time
+  float illuminance{0.0f};      // whole-frame brightness, 0..100%
+  bool has_illuminance{true};   // false while AE is settling or sensor state is unknown
 };
 
 class PersonDetector : public Component {

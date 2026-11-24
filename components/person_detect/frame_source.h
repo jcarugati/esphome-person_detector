@@ -21,7 +21,10 @@ struct FrameView {
   uint16_t height{0};
   FrameFormat format{FRAME_FORMAT_RGB888};
   // Relative exposure*gain ratio anchored at 1.0f for fixed exposure (or AE ceiling).
+  // NaN indicates the sensor exposure/gain is settling or unknown (skip illuminance/AE).
   float exposure_scale{1.0f};
+  // Stream session epoch matching the camera's stop_epoch_ when this frame was captured.
+  uint32_t capture_epoch{0};
 };
 
 // Normalize mean luma (0..255) by exposure_scale into relative ambient light [0, 100%].
@@ -61,9 +64,10 @@ class FrameSource {
   // frame may be in flight at a time.
   virtual void release() = 0;
 
-  // Optional feedback hook: report whole-frame mean luma (0..255) from the
-  // detector's raw frame for closed-loop auto-exposure backends. Default no-op.
-  virtual void report_luma(uint8_t /*mean_luma*/) {}
+  // Optional feedback hook: report whole-frame mean luma (0..255) and capture
+  // session epoch from the detector's raw frame for closed-loop auto-exposure
+  // backends. Default no-op.
+  virtual void report_luma(uint8_t /*mean_luma*/, uint32_t /*capture_epoch*/) {}
 };
 
 }  // namespace person_detect

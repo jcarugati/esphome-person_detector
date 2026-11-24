@@ -10,6 +10,7 @@ because stock ESPHome has no configurable MIPI-CSI camera platform yet.
 """
 
 import base64
+from pathlib import Path
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
@@ -22,6 +23,8 @@ from esphome.components.esp32 import (
     get_esp32_variant,
 )
 from esphome.components.person_detect import FrameSource
+from esphome.core import CORE
+from esphome.helpers import copy_file_if_changed
 from esphome.const import (
     CONF_ADDRESS,
     CONF_FREQUENCY,
@@ -259,6 +262,10 @@ async def to_code(config):
     add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE", True)
     add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER", True)
     add_idf_sdkconfig_option("CONFIG_ISP_PIPELINE_CONTROLLER_TASK_STACK_USE_PSRAM", True)
+    if config[CONF_AUTO_EXPOSURE]:
+        # Single controller ownership: disable ESP-IPA's built-in AGC so our
+        # closed-loop AE is the sole writer of V4L2_CID_EXPOSURE/V4L2_CID_GAIN.
+        add_idf_sdkconfig_option("CONFIG_ESP_IPA_AGC_ALGORITHM", False)
     if config[CONF_H264_STREAM]:
         # Use esp_h264 directly (lazy hardware encoder) rather than esp_video's
         # V4L2 M2M wrapper (which locks QP 25-26 and sets fps = gop).
@@ -275,5 +282,25 @@ async def to_code(config):
         add_idf_sdkconfig_option("CONFIG_CAMERA_SC202CS_ANA_GAIN_PRIORITY", True)
         add_idf_sdkconfig_option("CONFIG_CAMERA_SC202CS_DIG_GAIN_PRIORITY", False)
         add_idf_sdkconfig_option(mode_kconfig, True)
+        if config[CONF_AUTO_EXPOSURE]:
+            # esp_ipa_pipeline_create() fails esp_video_init() if the sensor IPA
+            # JSON still names "esp_ipa_agc" while CONFIG_ESP_IPA_AGC_ALGORITHM=n.
+            # Ship SC202CS's default IPA config without the "agc" block so IAN,
+            # AWB, ADN (demosaic/BF), ACC, and AEN stay active with zero AGC writes.
+            ipa_json_name = "sc202cs_no_agc.json"
+            copy_file_if_changed(
+                Path(__file__).parent / ipa_json_name,
+                Path(CORE.relative_build_path(ipa_json_name)),
+            )
+            add_idf_sdkconfig_option(
+                "CONFIG_CAMERA_SC202CS_DEFAULT_IPA_JSON_CONFIGURATION_FILE", False
+            )
+            add_idf_sdkconfig_option(
+                "CONFIG_CAMERA_SC202CS_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE", True
+            )
+            add_idf_sdkconfig_option(
+                "CONFIG_CAMERA_SC202CS_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE_PATH",
+                ipa_json_name,
+            )
 
     cg.add_define("USE_ESP_VIDEO_CAMERA")

@@ -15,9 +15,49 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 namespace esphome {
 namespace esp_video_camera {
+
+// Matches fixed-mode's omitted-gain default (25% of the legacy 0..255 fallback = 63)
+// so enabling auto_exposure with omitted `gain` keeps the exact same ceiling and
+// Ambient Light (%) reference as fixed mode.
+static constexpr int32_t DEFAULT_AE_GAIN_CEILING = 63;
+
+// SC202CS sensor pipeline delay (exposure_frame_delay = gain_frame_delay = 3 in
+// Espressif's s_ipa_agc_SC202CS_config).
+static constexpr uint8_t SC202CS_AE_PIPELINE_DELAY_FRAMES = 3;
+
+inline int32_t default_ae_gain_ceiling(int32_t min_gain, int32_t max_gain) {
+  if (min_gain > max_gain)
+    min_gain = max_gain;
+  return std::clamp<int32_t>(DEFAULT_AE_GAIN_CEILING, min_gain, max_gain);
+}
+
+// Number of post-write dequeued frames that must be marked settling (NaN scale):
+// - Task mode: all queued V4L2 buffers plus SC202CS's 3-frame register delay.
+// - Non-task mode: acquire() flushes stale buffers at the detector interval;
+//   mark 1 settling frame so the following frame reflects the new setting.
+inline uint8_t ae_settling_frame_count(uint8_t fb_count, bool task_mode) {
+  return task_mode ? static_cast<uint8_t>(fb_count + SC202CS_AE_PIPELINE_DELAY_FRAMES)
+                   : uint8_t{1};
+}
+
+// Single-word atomic packing for (mean_luma, capture_epoch) feedback from
+// person_detect to EspVideoCamera. 0 denotes empty; bit 40 marks valid.
+inline uint64_t pack_ae_feedback(uint8_t mean_luma, uint32_t capture_epoch) {
+  return (1ULL << 40) | (static_cast<uint64_t>(capture_epoch) << 8) |
+         static_cast<uint64_t>(mean_luma);
+}
+
+inline bool unpack_ae_feedback(uint64_t packed, uint8_t &mean_luma, uint32_t &capture_epoch) {
+  if (packed == 0)
+    return false;
+  mean_luma = static_cast<uint8_t>(packed & 0xFFULL);
+  capture_epoch = static_cast<uint32_t>((packed >> 8) & 0xFFFFFFFFULL);
+  return true;
+}
 
 // SC202CS physical gain multiplier for a V4L2_CID_GAIN enumeration index.
 // Matches espressif/esp_cam_sensor sc202cs_gain_map (ANA_GAIN_PRIORITY):
@@ -62,17 +102,6 @@ inline int32_t sc202cs_gain_index_for_factor(float factor, int32_t min_gain, int
   return std::clamp(idx, min_gain, max_gain);
 }
 
-// Exposure-normalized ambient light percentage in [0, 100]. Falls back to
-// exposure_scale == 1.0f if scale is non-finite or non-positive.
-inline float normalize_illuminance_pct(uint8_t mean_luma, float exposure_scale) {
-  const float safe_scale =
-      (std::isfinite(exposure_scale) && exposure_scale > 0.0f) ? exposure_scale : 1.0f;
-  const float pct = (static_cast<float>(mean_luma) / safe_scale) * 100.0f / 255.0f;
-  if (!std::isfinite(pct) || pct <= 0.0f)
-    return 0.0f;
-  return pct > 100.0f ? 100.0f : pct;
-}
-
 struct AutoExposureConfig {
   uint8_t target_luma{115};          // ~45% full scale (matches Nocturne light threshold)
   uint8_t deadband{18};              // hold steady for mean_luma in [97..133]
@@ -109,15 +138,70 @@ class AutoExposureController {
   void reset() {
     this->exposure_ = this->max_exp_;
     this->gain_ = this->max_gain_;
+    this->controls_known_ = false;
     this->has_updated_ = false;
     this->last_update_us_ = 0;
     this->settle_remaining_ = 0;
+    this->settling_frames_ = 0;
+  }
+
+  bool is_known() const { return this->controls_known_; }
+  bool is_settling() const { return this->settling_frames_ > 0; }
+  uint8_t settling_frames() const { return this->settling_frames_; }
+
+  // Record a complete, verified write of BOTH exposure and gain to the sensor.
+  void mark_applied(int32_t exp, int32_t gain, int64_t now_us, uint8_t settling_frames = 0) {
+    this->exposure_ = std::clamp(exp, this->min_exp_, this->max_exp_);
+    this->gain_ = std::clamp(gain, this->min_gain_, this->max_gain_);
+    this->controls_known_ = true;
+    this->has_updated_ = true;
+    this->last_update_us_ = now_us;
+    this->settling_frames_ = settling_frames;
+  }
+
+  // Record that an exposure or gain ioctl failed so physical sensor registers
+  // are unknown. Keeps target (exposure_, gain_) and rate-limit timestamp so
+  // the caller retries BOTH controls together once min_interval_us elapses.
+  void mark_unknown(int64_t now_us) {
+    this->controls_known_ = false;
+    this->has_updated_ = true;
+    this->last_update_us_ = now_us;
+    this->settle_remaining_ = 0;
+    this->settling_frames_ = 0;
+  }
+
+  // True when sensor registers are unknown and a full (exposure + gain) retry
+  // is allowed (immediately after reset, or once min_interval_us has elapsed).
+  bool should_retry_unknown(int64_t now_us) const {
+    if (this->controls_known_)
+      return false;
+    if (!this->has_updated_)
+      return true;
+    if (now_us < this->last_update_us_)
+      return true;
+    return (now_us - this->last_update_us_) >= this->cfg_.min_interval_us;
+  }
+
+  // Compute the exposure_scale stamp for a newly dequeued frame and advance the
+  // settling countdown once per dequeued frame. Returns NaN while settling or
+  // while physical sensor registers are unknown.
+  float stamp_dequeued_frame() {
+    if (this->settling_frames_ > 0) {
+      this->settling_frames_--;
+      return std::numeric_limits<float>::quiet_NaN();
+    }
+    return this->exposure_scale();
   }
 
   AutoExposureDecision update(uint8_t mean_luma, int64_t now_us) {
     AutoExposureDecision decision{};
     decision.exposure = this->exposure_;
     decision.gain = this->gain_;
+
+    // Never step from an unknown physical register state or while frames from a
+    // prior write are still draining through V4L2/sensor pipeline latency.
+    if (!this->controls_known_ || this->settling_frames_ > 0)
+      return decision;
 
     // Skip settle frame(s) after any applied SCCB write so sensor pipeline
     // latency cannot trigger oscillation.
@@ -208,17 +292,9 @@ class AutoExposureController {
     return decision;
   }
 
-  // Reconcile state after partial or complete V4L2 ioctl failure so
-  // exposure_scale() never desyncs from the sensor's actual registers.
-  // Keeps the rate-limit timestamp so a failing I2C bus is not spammed.
-  void sync_applied(int32_t actual_exp, int32_t actual_gain, bool hardware_changed) {
-    this->exposure_ = std::clamp(actual_exp, this->min_exp_, this->max_exp_);
-    this->gain_ = std::clamp(actual_gain, this->min_gain_, this->max_gain_);
-    if (!hardware_changed)
-      this->settle_remaining_ = 0;
-  }
-
   float exposure_scale() const {
+    if (!this->controls_known_)
+      return std::numeric_limits<float>::quiet_NaN();
     if (this->exposure_ == this->max_exp_ && this->gain_ == this->max_gain_)
       return 1.0f;
     if (!std::isfinite(this->ref_product_) || this->ref_product_ <= 0.0f)
@@ -247,9 +323,11 @@ class AutoExposureController {
   int32_t exposure_{1244};
   int32_t gain_{191};
   float ref_product_{1244.0f * 63.0f};
+  bool controls_known_{false};
   bool has_updated_{false};
   int64_t last_update_us_{0};
   uint8_t settle_remaining_{0};
+  uint8_t settling_frames_{0};
 };
 
 }  // namespace esp_video_camera

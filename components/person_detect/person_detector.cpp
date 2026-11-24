@@ -199,11 +199,17 @@ void PersonDetector::run_inference_(const FrameView &frame) {
       samples++;
     }
     px_sum = samples ? px_sum / samples : 0;  // reuse as mean luma
-    if (samples > 0)
-      this->source_->report_luma(static_cast<uint8_t>(px_sum));
+    if (samples > 0 && std::isfinite(frame.exposure_scale) && frame.exposure_scale > 0.0f)
+      this->source_->report_luma(static_cast<uint8_t>(px_sum), frame.capture_epoch);
   }
-  float illuminance_pct =
-      normalize_illuminance_pct(static_cast<uint8_t>(px_sum), frame.exposure_scale);
+  // NaN exposure_scale means the sensor is settling after an AE write or its
+  // registers are unknown after an ioctl failure: keep running person detection,
+  // skip AE feedback, and hold the previous Ambient Light (%) reading.
+  const bool has_illuminance = !std::isnan(frame.exposure_scale);
+  const float illuminance_pct =
+      has_illuminance
+          ? normalize_illuminance_pct(static_cast<uint8_t>(px_sum), frame.exposure_scale)
+          : NAN;
 
   uint32_t t0 = millis();
   // ESP-DL resizes the frame to the model's 224x224 input internally; on P4 that
@@ -245,6 +251,7 @@ void PersonDetector::run_inference_(const FrameView &frame) {
     this->pending_.count = count;
     this->pending_.infer_ms = dt;
     this->pending_.illuminance = illuminance_pct;
+    this->pending_.has_illuminance = has_illuminance;
     this->has_new_result_ = true;
   }
   xSemaphoreGive(this->result_mutex_);
@@ -303,7 +310,7 @@ void PersonDetector::loop() {
     this->confidence_sensor_->publish_state(r.best_score * 100.0f);
   if (this->count_sensor_ != nullptr)
     this->count_sensor_->publish_state(r.count);
-  if (this->illuminance_sensor_ != nullptr)
+  if (this->illuminance_sensor_ != nullptr && r.has_illuminance)
     this->illuminance_sensor_->publish_state(r.illuminance);
 #endif
 
