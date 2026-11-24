@@ -51,6 +51,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
  public:
   // Component: bring up the CSI/ISP pipeline before the detector's setup runs.
   void setup() override;
+  void loop() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
 
@@ -134,6 +135,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   // esp_h264_enc_hw instance only while an RTSP client is actively in PLAY.
   bool open_h264_();
   void teardown_h264_();
+  void start_rtsp_listener_();
   bool convert_frame_(const void *input, void *output, size_t output_size,
                       uint16_t width, uint16_t height, ppa_srm_color_mode_t mode,
                       float scale_x, float scale_y, uint16_t block_w = 0,
@@ -239,6 +241,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   bool task_mode_{false};
   std::atomic<uint32_t> task_frames_{0};  // camera task owns V4L2 (any live stream enabled)
   std::atomic<bool> h264_ready_{false};   // RTSP listener bound & task started
+  bool rtsp_listener_attempted_{false};   // main-loop one-shot guard (after lwIP init)
   int rtsp_server_fd_{-1};
   H264Geometry h264_geom_{};
   void *h264_enc_{nullptr};               // esp_h264_enc_handle_t; owned by capture_task_
