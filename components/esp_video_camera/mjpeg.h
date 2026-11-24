@@ -217,31 +217,5 @@ class FrameHandoff {
   std::atomic<uint32_t> packed_{0};
 };
 
-// Pure buffer-ownership tracker for the single-buffer V4L2 M2M H.264 path so
-// partial DQBUF timeouts (either CAPTURE or OUTPUT succeeding alone) stay in
-// recovery until both sides return to ready state.
-struct H264BufferState {
-  bool out_queued{false};
-  bool cap_queued{false};
-  bool cap_pending{false};
-
-  bool needs_recovery() const { return this->out_queued || this->cap_pending || !this->cap_queued; }
-  void reset() {
-    this->out_queued = false;
-    this->cap_queued = false;
-    this->cap_pending = false;
-  }
-  void on_cap_queued() { this->cap_queued = true; }
-  void on_out_queued() {
-    this->out_queued = true;
-    this->cap_pending = true;
-  }
-  void on_cap_dequeued() {
-    this->cap_queued = false;
-    this->cap_pending = false;
-  }
-  void on_out_dequeued() { this->out_queued = false; }
-};
-
 }  // namespace esp_video_camera
 }  // namespace esphome

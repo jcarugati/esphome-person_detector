@@ -34,6 +34,7 @@
 #endif
 
 #include "gray_world.h"
+#include "h264_rtp.h"
 #include "mjpeg.h"
 
 namespace esphome {
@@ -129,19 +130,23 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   void reassert_controls_();
 
   // Optional H.264/RTSP and MJPEG paths. A dedicated camera task is the sole
-  // V4L2 reader whenever a live stream is enabled.
-  bool setup_h264_();
-  void start_h264_();
+  // V4L2 reader whenever a live stream is enabled, and lazily owns the direct
+  // esp_h264_enc_hw instance only while an RTSP client is actively in PLAY.
+  bool open_h264_();
+  void teardown_h264_();
   bool convert_frame_(const void *input, void *output, size_t output_size,
                       uint16_t width, uint16_t height, ppa_srm_color_mode_t mode,
-                      float scale_x, float scale_y);
+                      float scale_x, float scale_y, uint16_t block_w = 0,
+                      uint16_t block_h = 0, uint16_t offset_x = 0,
+                      uint16_t offset_y = 0);
   void capture_task_();
   static void capture_task_entry_(void *arg);
   void rtsp_task_();
   static void rtsp_task_entry_(void *arg);
-  bool encode_h264_(uint32_t capture_epoch);
+  bool encode_h264_(uint32_t capture_epoch, uint32_t session_gen, int64_t frame_us);
   bool send_rtsp_(int fd, const char *data, size_t len);
-  void send_h264_rtp_(const uint8_t *data, size_t len, uint32_t capture_epoch);
+  void send_h264_rtp_(const uint8_t *data, size_t len, uint32_t rtp_timestamp,
+                      uint32_t capture_epoch, uint32_t session_gen);
 
   bool ensure_jpeg_encoder_();
   bool ensure_stream_rgb_();
@@ -230,18 +235,19 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   uint32_t capture_failures_{0};
   uint32_t last_ppa_us_{0};
 
-  // Camera task + H.264/RTSP state.
+  // Camera task + lazy direct H.264/RTSP state.
   bool task_mode_{false};
   std::atomic<uint32_t> task_frames_{0};  // camera task owns V4L2 (any live stream enabled)
-  bool h264_ready_{false};
-  H264BufferState h264_buf_state_{};
-  int h264_fd_{-1};
-  uint8_t *h264_yuv_{nullptr};
+  bool h264_ready_{false};                // RTSP listener started
+  H264Geometry h264_geom_{};
+  void *h264_enc_{nullptr};               // esp_h264_enc_handle_t; owned by capture_task_
+  uint8_t *h264_yuv_{nullptr};            // lazy PSRAM O_UYY_E_VYY input buffer
   size_t h264_yuv_size_{0};
-  uint8_t *h264_output_{nullptr};
+  uint8_t *h264_output_{nullptr};         // lazy PSRAM Annex-B output buffer
   size_t h264_output_size_{0};
-  uint16_t h264_w_{0};
-  uint16_t h264_h_{0};
+  uint8_t *rtp_packet_buf_{nullptr};      // lazy PSRAM interleaved RTP scratch (zero stack)
+  YuvChromaAwbState h264_awb_state_{};
+  H264SpropParams h264_sprop_{};          // cached SPS/PPS for SDP; guarded by sock_mutex_
   TaskHandle_t capture_task_handle_{nullptr};
   TaskHandle_t rtsp_task_handle_{nullptr};
   SemaphoreHandle_t frame_done_{nullptr};
@@ -252,8 +258,9 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   std::atomic<int> rtsp_client_fd_{-1};
   std::atomic<uint32_t> rtsp_session_gen_{0};
   uint16_t rtp_sequence_{0};
-  uint32_t rtp_timestamp_{0};
+  int64_t rtsp_play_start_us_{0};
   int64_t last_h264_us_{0};
+  uint32_t h264_encode_failures_{0};
 
   // Gray-world white balance: out-of-place scratch copy for full-res snapshots,
   // EMA state for in-place balancing on stream_rgb_.
