@@ -985,11 +985,13 @@ void EspVideoCamera::apply_sensor_controls_() {
   this->pending_ae_feedback_.store(0, std::memory_order_relaxed);
 
   const bool exp_ok = set_ext_ctrl(this->fd_, this->applied_exp_cid_, this->applied_exp_val_);
+  const int exp_err = exp_ok ? 0 : errno;
   const bool gain_ok = set_ext_ctrl(this->fd_, this->applied_gain_cid_, this->applied_gain_val_);
+  const int gain_err = gain_ok ? 0 : errno;
   const int64_t now_us = esp_timer_get_time();
   if (exp_ok && gain_ok) {
     this->ae_.mark_applied(this->applied_exp_val_, this->applied_gain_val_, now_us,
-                           ae_settling_frame_count(this->fb_count_, this->task_mode_));
+                           ae_settling_frame_count(this->fb_count_));
     ESP_LOGCONFIG(TAG, "sensor exposure=%d (AE range %d..%d, sensor %d..%d, default %d)",
                   this->applied_exp_val_, exp_lo, max_exp, exp_lo, exp_hi, exp_def);
     ESP_LOGCONFIG(TAG, "sensor gain=%d (AE range %d..%d, sensor %d..%d, default %d)",
@@ -997,11 +999,11 @@ void EspVideoCamera::apply_sensor_controls_() {
   } else {
     if (!exp_ok) {
       ESP_LOGW(TAG, "set exposure=%d failed: %s (sensor state unknown, will retry)",
-               this->applied_exp_val_, strerror(errno));
+               this->applied_exp_val_, strerror(exp_err));
     }
     if (!gain_ok) {
       ESP_LOGW(TAG, "set gain=%d failed: %s (sensor state unknown, will retry)",
-               this->applied_gain_val_, strerror(errno));
+               this->applied_gain_val_, strerror(gain_err));
     }
     this->ae_.mark_unknown(now_us);
   }
@@ -1039,12 +1041,14 @@ void EspVideoCamera::step_auto_exposure_(uint32_t current_epoch) {
     const bool exp_ok =
         this->applied_exp_cid_ != 0 &&
         set_ext_ctrl(this->fd_, this->applied_exp_cid_, this->ae_.exposure());
+    const int exp_err = exp_ok ? 0 : errno;
     const bool gain_ok =
         this->applied_gain_cid_ != 0 &&
         set_ext_ctrl(this->fd_, this->applied_gain_cid_, this->ae_.gain());
+    const int gain_err = gain_ok ? 0 : errno;
     if (exp_ok && gain_ok) {
       this->ae_.mark_applied(this->ae_.exposure(), this->ae_.gain(), now_us,
-                             ae_settling_frame_count(this->fb_count_, this->task_mode_));
+                             ae_settling_frame_count(this->fb_count_));
       this->applied_exp_val_ = this->ae_.exposure();
       this->applied_gain_val_ = this->ae_.gain();
       ESP_LOGI(TAG, "AE restored sensor controls: exp=%" PRId32 " gain=%" PRId32 " scale=%.3f",
@@ -1052,11 +1056,11 @@ void EspVideoCamera::step_auto_exposure_(uint32_t current_epoch) {
     } else {
       if (!exp_ok) {
         ESP_LOGW(TAG, "AE retry exposure=%" PRId32 " failed: %s",
-                 this->ae_.exposure(), strerror(errno));
+                 this->ae_.exposure(), strerror(exp_err));
       }
       if (!gain_ok) {
         ESP_LOGW(TAG, "AE retry gain=%" PRId32 " failed: %s",
-                 this->ae_.gain(), strerror(errno));
+                 this->ae_.gain(), strerror(gain_err));
       }
       this->ae_.mark_unknown(now_us);
     }
@@ -1099,7 +1103,7 @@ void EspVideoCamera::step_auto_exposure_(uint32_t current_epoch) {
 
   if (all_ok) {
     this->ae_.mark_applied(d.exposure, d.gain, now_us,
-                           ae_settling_frame_count(this->fb_count_, this->task_mode_));
+                           ae_settling_frame_count(this->fb_count_));
     this->applied_exp_val_ = this->ae_.exposure();
     this->applied_gain_val_ = this->ae_.gain();
     ESP_LOGD(TAG, "AE luma=%u -> exp=%" PRId32 " gain=%" PRId32 " scale=%.3f",
@@ -1231,6 +1235,8 @@ bool EspVideoCamera::acquire(person_detect::FrameView &out, uint32_t timeout_ms)
           break;  // nothing (more) ready
         if (stale.index < 32)
           this->queued_mask_ &= ~(1u << stale.index);
+        if (this->auto_exposure_)
+          (void) this->ae_.stamp_dequeued_frame();
         if (xioctl(this->fd_, VIDIOC_QBUF, &stale) == 0 && stale.index < 32)
           this->queued_mask_ |= (1u << stale.index);
       }

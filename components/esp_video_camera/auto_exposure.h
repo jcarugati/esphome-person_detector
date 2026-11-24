@@ -35,13 +35,11 @@ inline int32_t default_ae_gain_ceiling(int32_t min_gain, int32_t max_gain) {
   return std::clamp<int32_t>(DEFAULT_AE_GAIN_CEILING, min_gain, max_gain);
 }
 
-// Number of post-write dequeued frames that must be marked settling (NaN scale):
-// - Task mode: all queued V4L2 buffers plus SC202CS's 3-frame register delay.
-// - Non-task mode: acquire() flushes stale buffers at the detector interval;
-//   mark 1 settling frame so the following frame reflects the new setting.
-inline uint8_t ae_settling_frame_count(uint8_t fb_count, bool task_mode) {
-  return task_mode ? static_cast<uint8_t>(fb_count + SC202CS_AE_PIPELINE_DELAY_FRAMES)
-                   : uint8_t{1};
+// Number of post-write dequeued frames (including discarded stale buffers) that
+// must be marked settling (NaN scale): all queued V4L2 buffers plus SC202CS's
+// 3-frame register delay, in both task and non-task capture modes.
+inline uint8_t ae_settling_frame_count(uint8_t fb_count) {
+  return static_cast<uint8_t>(fb_count + SC202CS_AE_PIPELINE_DELAY_FRAMES);
 }
 
 // Single-word atomic packing for (mean_luma, capture_epoch) feedback from

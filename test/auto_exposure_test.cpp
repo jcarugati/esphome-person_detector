@@ -300,10 +300,8 @@ int main() {
   //    - First settled post-change frame reports 1.0x.
   {
     constexpr uint8_t kFbCount = 2;
-    const uint8_t task_settle = ae_settling_frame_count(kFbCount, true);
-    const uint8_t non_task_settle = ae_settling_frame_count(kFbCount, false);
-    assert(task_settle == kFbCount + 3);
-    assert(non_task_settle == 1);
+    const uint8_t settle = ae_settling_frame_count(kFbCount);
+    assert(settle == kFbCount + 3);
 
     ae.configure(8, 1244, 0, 0);
     ae.mark_applied(622, 0, 0, 0);  // Settled at exact 0.5x
@@ -317,11 +315,11 @@ int main() {
     // (luma=20 -> raw_ratio=5.75 -> clamped to +1 EV = 2.0x -> 622 -> 1244).
     const AutoExposureDecision step = ae.update(20, 5 * kSec);
     assert(step.changed && step.exposure_changed && step.exposure == 1244);
-    ae.mark_applied(step.exposure, step.gain, 5 * kSec, task_settle);
+    ae.mark_applied(step.exposure, step.gain, 5 * kSec, settle);
     assert(ae.is_settling() && ae.settling_frames() == 5);
 
     // Every queued V4L2 buffer + 3 SC202CS pipeline delay frames gets NaN.
-    for (uint8_t i = 0; i < task_settle; ++i) {
+    for (uint8_t i = 0; i < settle; ++i) {
       assert(!ae.update(250, 10 * kSec + i * kSec).changed);  // AE ignores feedback while settling
       const float settling_stamp = ae.stamp_dequeued_frame();
       assert(std::isnan(settling_stamp));
@@ -332,9 +330,27 @@ int main() {
     const float post_change_stamp = ae.stamp_dequeued_frame();
     assert(post_change_stamp == 1.0f);
 
-    // Non-task mode marks exactly 1 settling frame after a change.
-    ae.mark_applied(622, 0, 20 * kSec, non_task_settle);
-    assert(std::isnan(ae.stamp_dequeued_frame()));
+    // Non-task mode regression (Astra R2 #1): stale-buffer flush finds 0
+    // buffers and capture retries immediately (e.g. after failed frame
+    // conversion). All fb_count + 3 post-write dequeues must still return NaN
+    // so the 2nd post-write frame never receives the new scale before the
+    // 3-frame SC202CS pipeline delay elapses.
+    ae.mark_applied(622, 0, 20 * kSec, settle);
+    for (uint8_t i = 0; i < settle; ++i) {
+      // 0 stale buffers flushed; immediate retry dequeues 1 frame per attempt.
+      assert(std::isnan(ae.stamp_dequeued_frame()));
+    }
+    assert(!ae.is_settling());
+    assert(near(ae.stamp_dequeued_frame(), 0.5f));
+
+    // Non-task mode with stale-buffer flush: discarding kFbCount stale buffers
+    // counts toward settle, and the remaining 3 SC202CS delay frames still
+    // produce NaN before the settled frame returns 0.5f.
+    ae.mark_applied(622, 0, 25 * kSec, settle);
+    for (uint8_t i = 0; i < kFbCount; ++i)
+      assert(std::isnan(ae.stamp_dequeued_frame()));  // flushed stale buffers
+    for (uint8_t i = 0; i < 3; ++i)
+      assert(std::isnan(ae.stamp_dequeued_frame()));  // SC202CS 3-frame delay
     assert(near(ae.stamp_dequeued_frame(), 0.5f));
   }
 
