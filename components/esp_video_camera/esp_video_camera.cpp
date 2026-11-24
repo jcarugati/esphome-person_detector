@@ -270,11 +270,15 @@ void EspVideoCamera::setup() {
   if (this->h264_enabled_ || this->mjpeg_stream_enabled_) {
     this->frame_done_ = xSemaphoreCreateBinary();
     // Set before the task starts: it may run immediately on the other core and
-    // exits if it sees task_mode_ false.
-    this->task_mode_ = this->frame_done_ != nullptr;
-    if (this->task_mode_)
-      this->task_mode_ = xTaskCreatePinnedToCore(&EspVideoCamera::capture_task_entry_, "camera_stream",
-                                                 8192, this, 3, &this->capture_task_handle_, 1) == pdPASS;
+    // exits if it sees task_mode_ false. Only clear on creation failure so we
+    // never concurrently overwrite task_mode_ while the running task reads it.
+    if (this->frame_done_ != nullptr) {
+      this->task_mode_ = true;
+      if (xTaskCreatePinnedToCore(&EspVideoCamera::capture_task_entry_, "camera_stream",
+                                  8192, this, 3, &this->capture_task_handle_, 1) != pdPASS) {
+        this->task_mode_ = false;
+      }
+    }
     if (!this->task_mode_)
       ESP_LOGW(TAG, "camera task unavailable; streams follow the detector interval");
   }
@@ -859,67 +863,210 @@ void EspVideoCamera::apply_sensor_controls_() {
   // (set_ext_ctrl); the legacy VIDIOC_S_CTRL path isn't wired up. Query the
   // range best-effort (for logging + fractional targets), falling back to a
   // known range when the query isn't supported.
-  auto query_range = [this](uint32_t cid, int fb_lo, int fb_hi, int &lo, int &hi,
-                            int &def) {
-    lo = fb_lo;
-    hi = fb_hi;
-    def = -1;
-    struct v4l2_queryctrl q = {};
-    q.id = cid;
-    if (xioctl(this->fd_, VIDIOC_QUERYCTRL, &q) == 0 &&
-        !(q.flags & V4L2_CTRL_FLAG_DISABLED)) {
-      lo = (int) q.minimum;
-      hi = (int) q.maximum;
-      def = (int) q.default_value;
-    }
-  };
   auto pick = [](int explicit_val, int lo, int hi, float frac) {
     int v = explicit_val >= 0 ? explicit_val : (int) (lo + (hi - lo) * frac);
     return v < lo ? lo : (v > hi ? hi : v);
   };
 
-  int lo, hi, def;
+  if (!this->auto_exposure_) {
+    auto query_range = [this](uint32_t cid, int fb_lo, int fb_hi, int &lo, int &hi,
+                              int &def) {
+      lo = fb_lo;
+      hi = fb_hi;
+      def = -1;
+      struct v4l2_queryctrl q = {};
+      q.id = cid;
+      if (xioctl(this->fd_, VIDIOC_QUERYCTRL, &q) == 0 &&
+          !(q.flags & V4L2_CTRL_FLAG_DISABLED)) {
+        lo = (int) q.minimum;
+        hi = (int) q.maximum;
+        def = (int) q.default_value;
+      }
+    };
 
-  // Exposure is the dominant lever: the SC202CS powers up at its minimum (~8 of
-  // a ~1244 max = a near-black frame), so lift it well up by default. Remember
-  // the intent even if this first set fails, so reassert_controls_ retries it.
-  query_range(V4L2_CID_EXPOSURE, 8, 1244, lo, hi, def);
+    int lo, hi, def;
+
+    // Exposure is the dominant lever: the SC202CS powers up at its minimum (~8 of
+    // a ~1244 max = a near-black frame), so lift it well up by default. Remember
+    // the intent even if this first set fails, so reassert_controls_ retries it.
+    query_range(V4L2_CID_EXPOSURE, 8, 1244, lo, hi, def);
+    this->applied_exp_cid_ = V4L2_CID_EXPOSURE;
+    this->applied_exp_val_ = pick(this->exposure_, lo, hi, 0.65f);
+    if (set_ext_ctrl(this->fd_, this->applied_exp_cid_, this->applied_exp_val_))
+      ESP_LOGCONFIG(TAG, "sensor exposure=%d (range %d..%d, default %d)",
+                    this->applied_exp_val_, lo, hi, def);
+    else
+      ESP_LOGW(TAG, "set exposure=%d failed: %s (will retry)",
+               this->applied_exp_val_, strerror(errno));
+
+    // Gain: a modest lift on top. Prefer the generic gain control (which the
+    // SC202CS accepts); only fall back to analogue gain if that's rejected.
+    query_range(V4L2_CID_GAIN, 0, 255, lo, hi, def);
+    int gval = pick(this->gain_, lo, hi, 0.25f);
+    if (set_ext_ctrl(this->fd_, V4L2_CID_GAIN, gval)) {
+      this->applied_gain_cid_ = V4L2_CID_GAIN;
+      this->applied_gain_val_ = gval;
+      ESP_LOGCONFIG(TAG, "sensor gain=%d (range %d..%d, default %d)", gval, lo, hi,
+                    def);
+    } else {
+      query_range(V4L2_CID_ANALOGUE_GAIN, 0, 255, lo, hi, def);
+      gval = pick(this->gain_, lo, hi, 0.25f);
+      if (set_ext_ctrl(this->fd_, V4L2_CID_ANALOGUE_GAIN, gval)) {
+        this->applied_gain_cid_ = V4L2_CID_ANALOGUE_GAIN;
+        this->applied_gain_val_ = gval;
+        ESP_LOGCONFIG(TAG, "sensor analogue_gain=%d (range %d..%d, default %d)",
+                      gval, lo, hi, def);
+      }
+    }
+    this->rotated_exposure_scale_ = 1.0f;
+    this->last_ctrl_us_ = esp_timer_get_time();
+    return;
+  }
+
+  // Auto-exposure path: esp_video 2.2.0 implements VIDIOC_QUERY_EXT_CTRL (not
+  // legacy VIDIOC_QUERYCTRL), returning SC202CS's true bounds (exposure 8..1244,
+  // gain index 0..191). Fall back to VIDIOC_QUERYCTRL then known SC202CS bounds.
+  auto query_ext_range = [this](uint32_t cid, int fb_lo, int fb_hi, int &lo, int &hi,
+                                int &def) -> bool {
+    lo = fb_lo;
+    hi = fb_hi;
+    def = -1;
+    struct v4l2_query_ext_ctrl qe = {};
+    qe.id = cid;
+    if (xioctl(this->fd_, VIDIOC_QUERY_EXT_CTRL, &qe) == 0 &&
+        !(qe.flags & V4L2_CTRL_FLAG_DISABLED)) {
+      lo = static_cast<int>(qe.minimum);
+      hi = static_cast<int>(qe.maximum);
+      def = static_cast<int>(qe.default_value);
+      return true;
+    }
+    struct v4l2_queryctrl q = {};
+    q.id = cid;
+    if (xioctl(this->fd_, VIDIOC_QUERYCTRL, &q) == 0 &&
+        !(q.flags & V4L2_CTRL_FLAG_DISABLED)) {
+      lo = static_cast<int>(q.minimum);
+      hi = static_cast<int>(q.maximum);
+      def = static_cast<int>(q.default_value);
+      return true;
+    }
+    return false;
+  };
+
+  int exp_lo, exp_hi, exp_def;
+  query_ext_range(V4L2_CID_EXPOSURE, 8, 1244, exp_lo, exp_hi, exp_def);
+  const int max_exp = pick(this->exposure_, exp_lo, exp_hi, 0.65f);
+
+  int gain_lo, gain_hi, gain_def;
+  const bool gain_queried = query_ext_range(V4L2_CID_GAIN, 0, 191, gain_lo, gain_hi, gain_def);
+  int max_gain = pick(this->gain_, gain_lo, gain_hi, 0.25f);
+
   this->applied_exp_cid_ = V4L2_CID_EXPOSURE;
-  this->applied_exp_val_ = pick(this->exposure_, lo, hi, 0.65f);
-  if (set_ext_ctrl(this->fd_, this->applied_exp_cid_, this->applied_exp_val_))
-    ESP_LOGCONFIG(TAG, "sensor exposure=%d (range %d..%d, default %d)",
-                  this->applied_exp_val_, lo, hi, def);
-  else
+  this->applied_exp_val_ = max_exp;
+  if (set_ext_ctrl(this->fd_, this->applied_exp_cid_, this->applied_exp_val_)) {
+    ESP_LOGCONFIG(TAG, "sensor exposure=%d (AE range %d..%d, sensor %d..%d, default %d)",
+                  this->applied_exp_val_, exp_lo, max_exp, exp_lo, exp_hi, exp_def);
+  } else {
     ESP_LOGW(TAG, "set exposure=%d failed: %s (will retry)",
              this->applied_exp_val_, strerror(errno));
+  }
 
-  // Gain: a modest lift on top. Prefer the generic gain control (which the
-  // SC202CS accepts); only fall back to analogue gain if that's rejected.
-  query_range(V4L2_CID_GAIN, 0, 255, lo, hi, def);
-  int gval = pick(this->gain_, lo, hi, 0.25f);
-  if (set_ext_ctrl(this->fd_, V4L2_CID_GAIN, gval)) {
+  this->applied_gain_cid_ = 0;
+  this->applied_gain_val_ = -1;
+  if (set_ext_ctrl(this->fd_, V4L2_CID_GAIN, max_gain)) {
     this->applied_gain_cid_ = V4L2_CID_GAIN;
-    this->applied_gain_val_ = gval;
-    ESP_LOGCONFIG(TAG, "sensor gain=%d (range %d..%d, default %d)", gval, lo, hi,
-                  def);
+    this->applied_gain_val_ = max_gain;
+    ESP_LOGCONFIG(TAG, "sensor gain=%d (AE range %d..%d, sensor %d..%d, default %d)",
+                  max_gain, gain_lo, max_gain, gain_lo, gain_hi, gain_def);
+  } else if (gain_queried) {
+    // V4L2_CID_GAIN is confirmed supported by QUERY_EXT_CTRL; keep it armed so
+    // the post-STREAMON reassert retries this transient write failure.
+    this->applied_gain_cid_ = V4L2_CID_GAIN;
+    this->applied_gain_val_ = max_gain;
+    ESP_LOGW(TAG, "set gain=%d failed: %s (will retry)", max_gain, strerror(errno));
   } else {
-    query_range(V4L2_CID_ANALOGUE_GAIN, 0, 255, lo, hi, def);
-    gval = pick(this->gain_, lo, hi, 0.25f);
-    if (set_ext_ctrl(this->fd_, V4L2_CID_ANALOGUE_GAIN, gval)) {
+    query_ext_range(V4L2_CID_ANALOGUE_GAIN, 0, 191, gain_lo, gain_hi, gain_def);
+    max_gain = pick(this->gain_, gain_lo, gain_hi, 0.25f);
+    if (set_ext_ctrl(this->fd_, V4L2_CID_ANALOGUE_GAIN, max_gain)) {
       this->applied_gain_cid_ = V4L2_CID_ANALOGUE_GAIN;
-      this->applied_gain_val_ = gval;
-      ESP_LOGCONFIG(TAG, "sensor analogue_gain=%d (range %d..%d, default %d)",
-                    gval, lo, hi, def);
+      this->applied_gain_val_ = max_gain;
+      ESP_LOGCONFIG(TAG, "sensor analogue_gain=%d (AE range %d..%d, sensor %d..%d, default %d)",
+                    max_gain, gain_lo, max_gain, gain_lo, gain_hi, gain_def);
+    } else {
+      gain_lo = 0;
+      max_gain = 0;
     }
   }
+
+  // Configure and reset AE to its ceiling (exposure_scale == 1.0f) on every
+  // STREAMON so privacy OFF/ON recovers cleanly.
+  this->ae_.configure(exp_lo, max_exp, gain_lo, max_gain);
+  this->applied_exp_val_ = this->ae_.exposure();
+  if (this->applied_gain_cid_ != 0)
+    this->applied_gain_val_ = this->ae_.gain();
+  this->pending_ae_luma_.store(-1, std::memory_order_relaxed);
+  this->rotated_exposure_scale_ = this->ae_.exposure_scale();
+  this->ae_reassert_pending_ = true;
   this->last_ctrl_us_ = esp_timer_get_time();
 }
 
-void EspVideoCamera::reassert_controls_() {
-  if (this->applied_exp_val_ >= 0)
-    set_ext_ctrl(this->fd_, this->applied_exp_cid_, this->applied_exp_val_);
+bool EspVideoCamera::reassert_controls_() {
+  bool ok = true;
+  if (this->applied_exp_val_ >= 0 && this->applied_exp_cid_ != 0)
+    ok = set_ext_ctrl(this->fd_, this->applied_exp_cid_, this->applied_exp_val_) && ok;
   if (this->applied_gain_val_ >= 0 && this->applied_gain_cid_ != 0)
-    set_ext_ctrl(this->fd_, this->applied_gain_cid_, this->applied_gain_val_);
+    ok = set_ext_ctrl(this->fd_, this->applied_gain_cid_, this->applied_gain_val_) && ok;
+  return ok;
+}
+
+void EspVideoCamera::report_luma(uint8_t mean_luma) {
+  if (this->auto_exposure_)
+    this->pending_ae_luma_.store(static_cast<int32_t>(mean_luma), std::memory_order_relaxed);
+}
+
+void EspVideoCamera::step_auto_exposure_() {
+  if (!this->auto_exposure_)
+    return;
+  const int32_t sample = this->pending_ae_luma_.exchange(-1, std::memory_order_relaxed);
+  if (sample < 0)
+    return;
+
+  const int64_t now_us = esp_timer_get_time();
+  const int32_t prev_exp = this->ae_.exposure();
+  const int32_t prev_gain = this->ae_.gain();
+  const AutoExposureDecision d = this->ae_.update(static_cast<uint8_t>(sample), now_us);
+  if (!d.changed)
+    return;
+
+  int32_t actual_exp = prev_exp;
+  int32_t actual_gain = prev_gain;
+  bool any_written = false;
+  if (d.exposure_changed && this->applied_exp_cid_ != 0) {
+    if (set_ext_ctrl(this->fd_, this->applied_exp_cid_, d.exposure)) {
+      actual_exp = d.exposure;
+      any_written = true;
+    } else {
+      ESP_LOGW(TAG, "AE set exposure=%" PRId32 " failed: %s", d.exposure, strerror(errno));
+    }
+  }
+  if (d.gain_changed && this->applied_gain_cid_ != 0) {
+    if (set_ext_ctrl(this->fd_, this->applied_gain_cid_, d.gain)) {
+      actual_gain = d.gain;
+      any_written = true;
+    } else {
+      ESP_LOGW(TAG, "AE set gain=%" PRId32 " failed: %s", d.gain, strerror(errno));
+    }
+  }
+  if (actual_exp != d.exposure || actual_gain != d.gain) {
+    this->ae_.sync_applied(actual_exp, actual_gain, any_written);
+  }
+  this->applied_exp_val_ = this->ae_.exposure();
+  if (this->applied_gain_cid_ != 0)
+    this->applied_gain_val_ = this->ae_.gain();
+  if (any_written) {
+    ESP_LOGD(TAG, "AE luma=%d -> exp=%" PRId32 " gain=%" PRId32 " scale=%.3f",
+             (int) sample, this->ae_.exposure(), this->ae_.gain(),
+             this->ae_.exposure_scale());
+  }
 }
 
 void EspVideoCamera::stop() {
@@ -930,6 +1077,7 @@ void EspVideoCamera::stop() {
   this->streaming_.store(false);
   this->rtsp_playing_.store(false);
   this->mjpeg_awb_reset_.store(true);
+  this->pending_ae_luma_.store(-1, std::memory_order_relaxed);
   this->wake_all_waiters_();
   // sock_mutex_ is held only for fd registration/clear and non-blocking
   // shutdown() (never across send/recv/httpd_resp_send) so shutdown() cannot
@@ -991,6 +1139,7 @@ bool EspVideoCamera::acquire(person_detect::FrameView &out, uint32_t timeout_ms)
     out.width = this->out_w_;
     out.height = this->out_h_;
     out.format = person_detect::FRAME_FORMAT_RGB888;
+    out.exposure_scale = this->rotated_exposure_scale_;
     return true;
   }
   if (this->v4l2_mutex_ == nullptr || !this->streaming_.load())
@@ -1018,12 +1167,18 @@ bool EspVideoCamera::acquire(person_detect::FrameView &out, uint32_t timeout_ms)
       return false;
     }
 
-    // Re-assert exposure/gain periodically: a set right at STREAMON occasionally
-    // doesn't take (frame stays near-black) and some ISP paths drift it, so this
-    // self-corrects within a couple seconds regardless.
+    // Re-assert exposure/gain periodically when fixed; with auto_exposure,
+    // reassert active controls once after STREAMON (retrying until ok) so
+    // steady-state AE never wastes shared I2C0 bandwidth or clobbers AE state.
     if (esp_timer_get_time() - this->last_ctrl_us_ > 2000000) {
-      this->reassert_controls_();
-      this->last_ctrl_us_ = esp_timer_get_time();
+      if (!this->auto_exposure_) {
+        this->reassert_controls_();
+        this->last_ctrl_us_ = esp_timer_get_time();
+      } else if (this->ae_reassert_pending_) {
+        if (this->reassert_controls_())
+          this->ae_reassert_pending_ = false;
+        this->last_ctrl_us_ = esp_timer_get_time();
+      }
     }
 
     // Drop already-captured frames with a 0-tick non-blocking timeout so
@@ -1062,6 +1217,8 @@ bool EspVideoCamera::acquire(person_detect::FrameView &out, uint32_t timeout_ms)
         converted_full = this->convert_frame_(raw, this->rotated_, this->rotated_size_,
                                               this->out_w_, this->out_h_,
                                               PPA_SRM_COLOR_MODE_RGB888, 1.0f, 1.0f);
+        if (converted_full)
+          this->rotated_exposure_scale_ = this->auto_exposure_ ? this->ae_.exposure_scale() : 1.0f;
         if (mjpeg_gen != 0 && this->ensure_stream_rgb_()) {
           converted_mjpeg = this->convert_frame_(raw, this->stream_rgb_, this->stream_rgb_size_,
                                                  this->stream_w_, this->stream_h_,
@@ -1074,6 +1231,11 @@ bool EspVideoCamera::acquire(person_detect::FrameView &out, uint32_t timeout_ms)
       } else if (buf.index < 32) {
         this->queued_mask_ |= (1u << buf.index);
       }
+      // Step closed-loop AE after capturing rotated_exposure_scale_ so the
+      // current frame's scale matches its exposure and any SCCB write has the
+      // full detector interval to settle before the next acquire().
+      if (this->streaming_.load() && this->stop_epoch_.load() == start_epoch)
+        this->step_auto_exposure_();
       xSemaphoreGive(this->v4l2_mutex_);
       break;
     }
@@ -1117,6 +1279,7 @@ bool EspVideoCamera::acquire(person_detect::FrameView &out, uint32_t timeout_ms)
   out.width = this->out_w_;
   out.height = this->out_h_;
   out.format = person_detect::FRAME_FORMAT_RGB888;
+  out.exposure_scale = this->rotated_exposure_scale_;
   return true;
 }
 
@@ -1209,9 +1372,16 @@ void EspVideoCamera::capture_task_() {
     }
 
     if (esp_timer_get_time() - this->last_ctrl_us_ > 2000000) {
-      this->reassert_controls_();
-      this->last_ctrl_us_ = esp_timer_get_time();
+      if (!this->auto_exposure_) {
+        this->reassert_controls_();
+        this->last_ctrl_us_ = esp_timer_get_time();
+      } else if (this->ae_reassert_pending_) {
+        if (this->reassert_controls_())
+          this->ae_reassert_pending_ = false;
+        this->last_ctrl_us_ = esp_timer_get_time();
+      }
     }
+    this->step_auto_exposure_();
 
     struct v4l2_buffer buf = {};
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -1258,6 +1428,8 @@ void EspVideoCamera::capture_task_() {
       full_ready = this->convert_frame_(raw, this->rotated_, this->rotated_size_,
                                         this->out_w_, this->out_h_,
                                         PPA_SRM_COLOR_MODE_RGB888, 1.0f, 1.0f);
+      if (full_ready)
+        this->rotated_exposure_scale_ = this->auto_exposure_ ? this->ae_.exposure_scale() : 1.0f;
       full_failed = !full_ready;
     }
 
@@ -2289,6 +2461,7 @@ void EspVideoCamera::dump_config() {
                 YESNO(this->swap_rgb_));
   ESP_LOGCONFIG(TAG, "  PPA output buffer: %u bytes PSRAM",
                 (unsigned) this->rotated_size_);
+  ESP_LOGCONFIG(TAG, "  Auto-exposure: %s", this->auto_exposure_ ? "enabled" : "disabled");
   if (this->mjpeg_stream_enabled_) {
     ESP_LOGCONFIG(TAG, "  MJPEG stream: %ux%u q%u (lazy %u-byte PSRAM buffer)",
                   this->stream_w_, this->stream_h_, (unsigned) MJPEG_JPEG_QUALITY,

@@ -33,6 +33,7 @@
 #include <esp_http_server.h>
 #endif
 
+#include "auto_exposure.h"
 #include "gray_world.h"
 #include "h264_rtp.h"
 #include "mjpeg.h"
@@ -61,6 +62,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   void stop() override;
   bool acquire(person_detect::FrameView &out, uint32_t timeout_ms) override;
   void release() override;
+  void report_luma(uint8_t mean_luma) override;
 
   // Codegen setters
   void set_sccb_pins(int sda, int scl) {
@@ -98,6 +100,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   void set_snapshot(bool enabled) { this->snapshot_enabled_ = enabled; }
   void set_mjpeg_stream(bool enabled) { this->mjpeg_stream_enabled_ = enabled; }
   void set_auto_white_balance(bool enabled) { this->awb_enabled_ = enabled; }
+  void set_auto_exposure(bool enabled) { this->auto_exposure_ = enabled; }
   void set_h264_stream(bool enabled) { this->h264_enabled_ = enabled; }
   void set_h264_auth(const std::string &auth) { this->h264_auth_ = auth; }
 
@@ -128,7 +131,10 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   // Re-apply the chosen exposure/gain. A set right at STREAMON occasionally
   // doesn't take (and some ISP paths drift exposure), so acquire() calls this
   // periodically so a missed/drifted value self-corrects. Silent.
-  void reassert_controls_();
+  bool reassert_controls_();
+  // Consume any luma sample reported by person_detect and step closed-loop AE
+  // on the V4L2-owning thread (never called from person_detect).
+  void step_auto_exposure_();
 
   // Optional H.264/RTSP and MJPEG paths. A dedicated camera task is the sole
   // V4L2 reader whenever a live stream is enabled, and lazily owns the direct
@@ -193,6 +199,7 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   uint8_t fb_count_{2};
   int exposure_{-1};  // raw sensor exposure; -1 = auto-pick a bright default
   int gain_{-1};      // raw sensor gain;     -1 = auto-pick a moderate default
+  bool auto_exposure_{false};
   bool h264_enabled_{false};
   std::string h264_auth_;
 
@@ -202,6 +209,10 @@ class EspVideoCamera : public Component, public person_detect::FrameSource {
   uint32_t applied_gain_cid_{0};
   int applied_gain_val_{-1};
   int64_t last_ctrl_us_{0};
+  AutoExposureController ae_{};
+  std::atomic<int32_t> pending_ae_luma_{-1};
+  bool ae_reassert_pending_{false};
+  float rotated_exposure_scale_{1.0f};
 
   // Runtime
   bool ready_{false};

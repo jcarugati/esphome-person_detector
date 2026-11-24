@@ -66,6 +66,7 @@ CONF_IMU = "imu"
 CONF_SNAPSHOT = "snapshot"
 CONF_MJPEG_STREAM = "mjpeg_stream"
 CONF_AUTO_WHITE_BALANCE = "auto_white_balance"
+CONF_AUTO_EXPOSURE = "auto_exposure"
 CONF_H264_STREAM = "h264_stream"
 CONF_H264_USERNAME = "h264_username"
 CONF_H264_PASSWORD = "h264_password"
@@ -152,6 +153,8 @@ CONFIG_SCHEMA = cv.Schema(
         # Gray-world white balance on the JPEG copy only; the detector frame and
         # ISP are untouched.
         cv.Optional(CONF_AUTO_WHITE_BALANCE, default=False): cv.boolean,
+        # Opt-in slow closed-loop auto-exposure capped by exposure/gain below.
+        cv.Optional(CONF_AUTO_EXPOSURE, default=False): cv.boolean,
         # Authenticated H.264 over RTSP/TCP on port 8554. Credentials are
         # required only when opted in; reuse the web_server credentials in YAML.
         cv.Optional(CONF_H264_STREAM, default=False): cv.boolean,
@@ -233,6 +236,7 @@ async def to_code(config):
     cg.add(var.set_snapshot(config[CONF_SNAPSHOT]))
     cg.add(var.set_mjpeg_stream(config[CONF_MJPEG_STREAM]))
     cg.add(var.set_auto_white_balance(config[CONF_AUTO_WHITE_BALANCE]))
+    cg.add(var.set_auto_exposure(config[CONF_AUTO_EXPOSURE]))
     cg.add(var.set_h264_stream(config[CONF_H264_STREAM]))
     if config[CONF_H264_STREAM]:
         credentials = f"{config[CONF_H264_USERNAME]}:{config[CONF_H264_PASSWORD]}"

@@ -199,8 +199,11 @@ void PersonDetector::run_inference_(const FrameView &frame) {
       samples++;
     }
     px_sum = samples ? px_sum / samples : 0;  // reuse as mean luma
+    if (samples > 0)
+      this->source_->report_luma(static_cast<uint8_t>(px_sum));
   }
-  float illuminance_pct = px_sum * 100.0f / 255.0f;
+  float illuminance_pct =
+      normalize_illuminance_pct(static_cast<uint8_t>(px_sum), frame.exposure_scale);
 
   uint32_t t0 = millis();
   // ESP-DL resizes the frame to the model's 224x224 input internally; on P4 that
@@ -224,10 +227,10 @@ void PersonDetector::run_inference_(const FrameView &frame) {
 
   ESP_LOGD(TAG,
            "inference %ums: %ux%u boxes=%u best=%.2f present=%d "
-           "luma[min=%u max=%u mean=%u] light=%.0f%% psram_free=%u",
+           "luma[min=%u max=%u mean=%u] scale=%.3f light=%.0f%% psram_free=%u",
            (unsigned) dt, frame.width, frame.height, (unsigned) results.size(),
            best, person, (unsigned) px_min, (unsigned) px_max, (unsigned) px_sum,
-           illuminance_pct, (unsigned) psram);
+           frame.exposure_scale, illuminance_pct, (unsigned) psram);
 
   xSemaphoreTake(this->result_mutex_, portMAX_DELAY);
   this->last_infer_ms_ = dt;
