@@ -1,5 +1,6 @@
 #include "esp_video_camera.h"
 
+#include "esphome/core/application.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
@@ -278,9 +279,11 @@ void EspVideoCamera::setup() {
       ESP_LOGW(TAG, "camera task unavailable; streams follow the detector interval");
   }
 #ifdef USE_ESP_VIDEO_CAMERA_H264
-  // Note: RTSP socket bind/listen is deferred to loop() (see start_rtsp_listener_())
-  // because setup() runs at priority DATA (600), before ESPHome's NetworkComponent
-  // initializes lwIP / esp_netif_init() at AFTER_BLUETOOTH (300).
+  // Note: RTSP socket bind/listen is deferred to loop() after App.is_setup_complete()
+  // (see start_rtsp_listener_()) because setup() runs at priority DATA (600), before
+  // ESPHome's NetworkComponent initializes lwIP / esp_netif_init() at AFTER_BLUETOOTH
+  // (300), and earlier loops can still be polled while a mid-priority component blocks
+  // in can_proceed().
 #endif
   ESP_LOGCONFIG(TAG, "esp_video_camera ready: capture %ux%u -> rotate %u -> "
                      "RGB888 %ux%u (stream %ux%u)",
@@ -290,11 +293,18 @@ void EspVideoCamera::setup() {
 
 void EspVideoCamera::loop() {
 #ifdef USE_ESP_VIDEO_CAMERA_H264
-  if (this->h264_enabled_ && this->task_mode_ && !this->rtsp_listener_attempted_) {
+  if (!this->h264_enabled_ || !this->task_mode_) {
+    this->disable_loop();
+    return;
+  }
+  if (!App.is_setup_complete())
+    return;
+  if (!this->rtsp_listener_attempted_) {
     this->rtsp_listener_attempted_ = true;
     this->start_rtsp_listener_();
   }
 #endif
+  this->disable_loop();
 }
 
 void EspVideoCamera::start_rtsp_listener_() {
@@ -696,9 +706,10 @@ bool EspVideoCamera::open_h264_() {
     this->teardown_h264_();
     return false;
   }
-  // esp_h264 1.3.0 enc_open() omits a NULL check on its internal frame_done
-  // semaphore (esp_h264_mutex_create()). Require internal SRAM headroom first
-  // so enc_open() cannot dereference a NULL semaphore under memory pressure.
+  // espressif/esp_h264 1.3.0 (exact version hard-pinned by espressif/esp_video 2.2.0)
+  // omits a NULL check on its internal frame_done semaphore inside enc_open(). This
+  // pre-open internal SRAM headroom check is a best-effort mitigation (not an atomic
+  // reservation) so enc_open() is skipped under obvious internal-heap pressure.
   const size_t pre_open_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
   const size_t pre_open_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
   if (pre_open_free < H264_MIN_PRE_OPEN_INTERNAL_FREE ||
@@ -1471,7 +1482,6 @@ bool EspVideoCamera::send_h264_rtp_(const uint8_t *data, size_t len, uint32_t rt
   };
 
   size_t packets_sent = 0;
-  bool partial_written = false;
   const bool ok = packetize_h264_annex_b_interleaved(
       data, len, rtp_timestamp, this->rtp_sequence_, H264_RTP_MAX_PAYLOAD, 0,
       this->rtp_packet_buf_, H264_RTP_SCRATCH_ALLOC_SIZE,
@@ -1524,11 +1534,8 @@ bool EspVideoCamera::send_h264_rtp_(const uint8_t *data, size_t len, uint32_t rt
             // so a waiting send_rtsp_() cannot append a control reply mid-packet.
             this->rtsp_partial_active_ = true;
             this->rtsp_partial_session_ = session_gen;
-            partial_written = true;
           }
           xSemaphoreGive(this->rtsp_send_mutex_);
-        } else if (!packet_ok && sent > 0) {
-          partial_written = true;
         }
         if (packet_ok)
           ++packets_sent;
@@ -1537,7 +1544,7 @@ bool EspVideoCamera::send_h264_rtp_(const uint8_t *data, size_t len, uint32_t rt
   if (!ok) {
     xSemaphoreTake(this->sock_mutex_, portMAX_DELAY);
     if (this->rtsp_client_fd_.load() == fd &&
-        (this->rtsp_session_gen_.load() == session_gen || partial_written)) {
+        this->rtsp_session_gen_.load() == session_gen) {
       this->rtsp_playing_.store(false);
       shutdown(fd, SHUT_RDWR);
     }
