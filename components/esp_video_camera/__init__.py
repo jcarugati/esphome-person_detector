@@ -50,6 +50,9 @@ EspVideoCamera = esp_video_camera_ns.class_(
 # an esp_cam_sensor that still used the SC2356 name and predates IDF 5.5.4.
 ESP_VIDEO_COMPONENT = "espressif/esp_video"
 ESP_VIDEO_REF = "2.2.0"
+# Direct hardware H.264 encoder component (matches esp_video 2.2.0's pin).
+ESP_H264_COMPONENT = "espressif/esp_h264"
+ESP_H264_REF = "1.3.0"
 
 CONF_POWERDOWN_PIN = "powerdown_pin"
 CONF_ENABLE_PIN = "enable_pin"
@@ -253,7 +256,10 @@ async def to_code(config):
     add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER", True)
     add_idf_sdkconfig_option("CONFIG_ISP_PIPELINE_CONTROLLER_TASK_STACK_USE_PSRAM", True)
     if config[CONF_H264_STREAM]:
-        add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_HW_H264_VIDEO_DEVICE", True)
+        # Use esp_h264 directly (lazy hardware encoder) rather than esp_video's
+        # V4L2 M2M wrapper (which locks QP 25-26 and sets fps = gop).
+        add_idf_component(name=ESP_H264_COMPONENT, ref=ESP_H264_REF)
+        cg.add_define("USE_ESP_VIDEO_CAMERA_H264")
     if config[CONF_SENSOR] == SENSOR_SC2356:
         # Enable the SC202CS driver AND its MIPI auto-detect: esp_video_init only
         # probes sensors whose auto-detect fn is registered, so without this no
